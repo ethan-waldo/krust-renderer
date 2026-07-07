@@ -1,23 +1,34 @@
-use crate::ray::Ray;
-use crate::utility::{random_float, random_int, clamp, INF};
-use crate::vec3::Vec3;
 use crate::color::Color;
-use crate::texture::TextureMap;
-use std::f64::consts::PI;
-use crate::hit::{HitRecord, HittableList, Object, Hittable};
-use std::sync::Arc;
-use crate::onb::Onb;
-use crate::pdf::{Pdf, CosinePdf, LightPdf};
+use crate::hit::{HitRecord, Hittable, HittableList, Object};
 use crate::lights::QuadLight;
+use crate::onb::Onb;
+use crate::pdf::{CosinePdf, LightPdf, Pdf};
+use crate::ray::Ray;
+use crate::texture::TextureMap;
+use crate::utility::{clamp, random_float, random_int, INF};
 use crate::vec2::Vec2;
-
+use crate::vec3::Vec3;
+use std::f64::consts::PI;
+use std::sync::Arc;
 
 pub trait Scatterable {
-    fn scatter(&self, ray: &Ray, hit_record: &HitRecord, lights: &Arc<Vec<Object>>) -> Option<(Ray, Color, Color, String)>;
+    fn scatter(
+        &self,
+        ray: &Ray,
+        hit_record: &HitRecord,
+        lights: &Arc<Vec<Object>>,
+    ) -> Option<(Ray, Color, Color, String)>;
 }
 
 pub trait Emits {
     fn emit(&self) -> Color;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct SurfaceSample {
+    pub albedo: Color,
+    pub roughness: f64,
+    pub emission: Color,
 }
 
 #[derive(Debug, Clone)]
@@ -26,8 +37,26 @@ pub enum Material {
     Light(Light),
 }
 
+impl Material {
+    pub fn surface_sample(&self, hit_rec: &HitRecord) -> SurfaceSample {
+        match self {
+            Material::Principle(principle) => principle.surface_sample(hit_rec),
+            Material::Light(light) => SurfaceSample {
+                albedo: Color::black(),
+                roughness: 0.0,
+                emission: light.emit(),
+            },
+        }
+    }
+}
+
 impl Scatterable for Material {
-    fn scatter(&self, ray: &Ray, hit_rec: &HitRecord, lights: &Arc<Vec<Object>>) -> Option<(Ray, Color, Color, String)> {
+    fn scatter(
+        &self,
+        ray: &Ray,
+        hit_rec: &HitRecord,
+        lights: &Arc<Vec<Object>>,
+    ) -> Option<(Ray, Color, Color, String)> {
         match self {
             Material::Principle(principle) => principle.scatter(ray, hit_rec, lights),
             Material::Light(light) => light.scatter(ray, hit_rec, lights),
@@ -93,7 +122,6 @@ impl Principle {
         emission_texture: Option<TextureMap>,
         bump_texture: Option<TextureMap>,
         normal_texture: Option<TextureMap>,
-        
     ) -> Principle {
         Principle {
             diffuse,
@@ -144,10 +172,10 @@ impl Principle {
             refraction_texture: None,
             emission_texture: None,
             bump_texture: None,
-            normal_texture: None
+            normal_texture: None,
         }
     }
-    
+
     pub fn reflectance(cosine: f64, ref_idx: f64) -> f64 {
         let mut r0 = (1.0 - ref_idx) / (1.0 + ref_idx);
         r0 = r0 * r0;
@@ -156,7 +184,30 @@ impl Principle {
 
     pub fn scatter_pdf(r_in: &Ray, rec: &HitRecord, scattered: &Ray) -> f64 {
         let cosine = Vec3::dot(&rec.normal, &scattered.direction.normalize());
-        return if cosine < 0.0 {0.0} else {cosine / PI}
+        return if cosine < 0.0 { 0.0 } else { cosine / PI };
+    }
+
+    pub fn surface_sample(&self, rec: &HitRecord) -> SurfaceSample {
+        let mut albedo = self.diffuse;
+        if let Some(diffuse_texture) = &self.diffuse_texture {
+            albedo = diffuse_texture.sample(rec.uv.x, rec.uv.y);
+        }
+
+        let mut roughness = self.roughness;
+        if let Some(roughness_texture) = &self.roughness_texture {
+            roughness = roughness_texture.sample(rec.uv.x, rec.uv.y).r;
+        }
+
+        let mut emission = self.emission;
+        if let Some(emission_texture) = &self.emission_texture {
+            emission = emission_texture.sample(rec.uv.x, rec.uv.y);
+        }
+
+        SurfaceSample {
+            albedo,
+            roughness,
+            emission,
+        }
     }
 }
 
@@ -167,107 +218,127 @@ impl Emits for Principle {
 }
 
 impl Scatterable for Principle {
-    fn scatter(&self, r_in: &Ray, rec: &HitRecord, lights: &Arc<Vec<Object>>) -> Option<(Ray, Color, Color, String)> {
+    fn scatter(
+        &self,
+        r_in: &Ray,
+        rec: &HitRecord,
+        lights: &Arc<Vec<Object>>,
+    ) -> Option<(Ray, Color, Color, String)> {
         // sample textures if available
         let mut diffuse = self.diffuse;
         if let Some(d) = &self.diffuse_texture {
-            diffuse = self.diffuse_texture
+            diffuse = self
+                .diffuse_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
                 .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0));
-        } 
+        }
 
         let mut diffuse_weight = self.diffuse_weight;
         if let Some(dwt) = &self.diffuse_weight_texture {
-            diffuse_weight = self.diffuse_weight_texture
+            diffuse_weight = self
+                .diffuse_weight_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
-                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0)).r;
-        } 
+                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0))
+                .r;
+        }
 
         let mut specular = self.specular;
         if let Some(st) = &self.specular_texture {
-            specular = self.specular_texture
+            specular = self
+                .specular_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
                 .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0));
-        } 
+        }
 
         let mut specular_weight = self.specular_weight;
         if let Some(swt) = &self.specular_weight_texture {
-            specular_weight = self.specular_weight_texture
+            specular_weight = self
+                .specular_weight_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
-                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0)).r;
+                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0))
+                .r;
         }
-        
+
         let mut roughness = self.roughness;
         if let Some(rt) = &self.roughness_texture {
-            roughness = self.roughness_texture
+            roughness = self
+                .roughness_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
-                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0)).r;
-        } 
+                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0))
+                .r;
+        }
 
         let mut metallic = self.metallic;
         if let Some(mt) = &self.metallic_texture {
-            metallic = self.metallic_texture
+            metallic = self
+                .metallic_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
-                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0)).r;
-        } 
+                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0))
+                .r;
+        }
 
         let mut refraction = self.refraction;
         if let Some(rft) = &self.refraction_texture {
-            refraction = self.refraction_texture
+            refraction = self
+                .refraction_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
-                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0)).r;
-        } 
+                .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0))
+                .r;
+        }
 
         let mut emission = self.emission;
         if let Some(et) = &self.emission_texture {
-            emission = self.emission_texture
+            emission = self
+                .emission_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
                 .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0));
-        } 
+        }
 
         let mut bump = 0.0;
         let mut bump_gradient = Color::black();
         let mut has_bump = false;
         if let Some(et) = &self.bump_texture {
-            bump = self.bump_texture
+            bump = self
+                .bump_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y).r)
                 .unwrap_or_else(|| 0.0);
-            bump_gradient = self.bump_texture
+            bump_gradient = self
+                .bump_texture
                 .as_ref()
                 .map(|t| t.get_gradient(rec.uv.x, rec.uv.y))
                 .unwrap_or_else(|| Color::black());
             has_bump = true;
-        } 
+        }
 
         let mut has_normal = false;
         let mut normal_map = Color::black();
         if let Some(nm) = &self.normal_texture {
-            normal_map = self.normal_texture
+            normal_map = self
+                .normal_texture
                 .as_ref()
                 .map(|t| t.sample(rec.uv.x, rec.uv.y))
                 .unwrap_or_else(|| Color::black());
-                has_normal = true;
-        } 
+            has_normal = true;
+        }
 
         // bump map
         let mut perturbed_normal = rec.normal;
         let (t, b) = rec.normal.tangent_bitangent();
-        if has_bump {            
+        if has_bump {
             let bump_gradient = bump_gradient * self.bump_strength * 10.0;
-            perturbed_normal = (
-                rec.normal
+            perturbed_normal = (rec.normal
                 + (bump_gradient.g * t * rec.normal)
                 + (bump_gradient.r * b * rec.normal))
-                .normalize();     
+                .normalize();
         }
 
         //  normal map
@@ -316,12 +387,12 @@ impl Scatterable for Principle {
             let (s, t) = (random_float(), random_float());
             on_light = quad_light.position
                 + quad_light.x_axis * (s - 0.5) * quad_light.width
-                + quad_light.y_axis * (t - 0.5) * quad_light.height;  
+                + quad_light.y_axis * (t - 0.5) * quad_light.height;
 
             // compute the direction
             to_light = on_light - rec.point;
         }
-        
+
         // compute probability of each lobe
         let roll = random_float();
         diffuse_weight = clamp(diffuse_weight - metallic - refraction, 0.0, 1.0);
@@ -330,7 +401,7 @@ impl Scatterable for Principle {
         let mut specular_prob = specular_weight / (specular_weight + diffuse_weight);
 
         // refraction
-        if refract {               
+        if refract {
             let cos_theta = f64::min(Vec3::dot(&(unit_direction * -1.0), &perturbed_normal), 1.0);
             let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
             let refraction_ratio = if cos_theta > 0.0 {
@@ -343,44 +414,51 @@ impl Scatterable for Principle {
                 self.ior
             };
 
-            let mut direction = unit_direction + Vec3::random_unit_vector() * roughness; 
+            let mut direction = unit_direction + Vec3::random_unit_vector() * roughness;
             let real_refract = false;
             if real_refract {
                 direction = Vec3::refract(&unit_direction, &rec.normal, refraction_ratio)
-                     + Vec3::random_unit_vector() * roughness;
+                    + Vec3::random_unit_vector() * roughness;
             }
 
             let scattered = Ray::new(rec.point, direction, r_in.time);
             let attenuation = Color::white();
 
-            return Some((scattered, attenuation * 2.0, emission, "refraction".to_string()));
-        } 
-        
+            return Some((
+                scattered,
+                attenuation * 2.0,
+                emission,
+                "refraction".to_string(),
+            ));
+        }
+
         // specular
         if specular_prob > roll {
             // reflectance values
             let ior_to_f0 = ((self.ior - 1.0) / (self.ior + 1.0)).powf(2.0);
             let basic_f0 = Vec3::new(ior_to_f0, ior_to_f0, ior_to_f0);
             let metal_f0 = Vec3::new(0.85, 0.85, 0.85);
-            
+
             // roughness, view angle, normal
-            let r = if roughness == 0.0 {0.001} else {roughness};
+            let r = if roughness == 0.0 { 0.001 } else { roughness };
             let v = -r_in.direction.normalize();
             let mut n = perturbed_normal.normalize();
             let mut l = n;
             let mut h = n;
-            
+
             // on axis check
             let t = 0.02;
-            if n.x > 1.0-t && n.y < t && n.z < t
-            || n.x < t && n.y > 1.0-t && n.z < t
-            || n.x < t && n.y < t && n.z > 1.0-t 
-            {n = n + Vec3::random_unit_vector() * roughness;}
+            if n.x > 1.0 - t && n.y < t && n.z < t
+                || n.x < t && n.y > 1.0 - t && n.z < t
+                || n.x < t && n.y < t && n.z > 1.0 - t
+            {
+                n = n + Vec3::random_unit_vector() * roughness;
+            }
 
             // determine direction of reflected ray
             let direct = random_float() < 0.5;
             if direct {
-                // sample a light                          
+                // sample a light
                 l = to_light;
                 h = (v + l).normalize();
             } else {
@@ -390,7 +468,7 @@ impl Scatterable for Principle {
             }
 
             // scattered ray
-            let scattered =  Ray::new(rec.point, l, r_in.time); 
+            let scattered = Ray::new(rec.point, l, r_in.time);
 
             // dots
             let ndv = f64::max(n.dot(&v), 0.0);
@@ -399,34 +477,35 @@ impl Scatterable for Principle {
             let ldh = f64::max(l.dot(&h), 0.0);
 
             // ggx
-            let f0 = if metal {metal_f0} else {basic_f0};
+            let f0 = if metal { metal_f0 } else { basic_f0 };
             let d: f64 = ggx_distribution(ndh, r);
             let g: f64 = schlick_masking(ndl, ndv, r);
             let f: Color = schlick_fresnel(f0, ldh);
-            let ggx =  f * g * d / f64::max((4.0 * ndv * ndl), 0.015);
+            let ggx = f * g * d / f64::max((4.0 * ndv * ndl), 0.015);
 
             // compute weights
             let light_pdf = LightPdf::new(lights.clone(), rec.point, rec.normal);
             let direct_weight = light_pdf.value(&scattered.direction);
             let indirect_weight = d * ndh / (4.0 * ldh);
-            let weight = direct_weight * 0.5 + indirect_weight * 0.5;                  
+            let weight = direct_weight * 0.5 + indirect_weight * 0.5;
 
             // final color composite
-            let attenuation = 
-            if metal {diffuse * ggx * ndl / (weight * specular_prob)} 
-            else {specular * ggx * ndl / (weight * specular_prob)};
+            let attenuation = if metal {
+                diffuse * ggx * ndl / (weight * specular_prob)
+            } else {
+                specular * ggx * ndl / (weight * specular_prob)
+            };
 
-            return Some((scattered, attenuation, emission, "specular".to_string()))          
-
-        } else {            
+            return Some((scattered, attenuation, emission, "specular".to_string()));
+        } else {
             // diffuse
             let cosine_pdf = CosinePdf::new(perturbed_normal);
             let mut scattered = Ray::new(rec.point, cosine_pdf.generate(), r_in.time);
 
             // directly sample lights half the time
             let direct = random_float() > 0.5;
-            if direct {    
-                scattered.direction = to_light;               
+            if direct {
+                scattered.direction = to_light;
             }
 
             // compute weights
@@ -439,12 +518,11 @@ impl Scatterable for Principle {
             // final color composite
             let attenuation = diffuse * diffuse_weight * pdf / (1.0 - specular_prob);
 
-            return Some((scattered, attenuation, emission, "diffuse".to_string()))
-        }      
-        None     
-    } 
+            return Some((scattered, attenuation, emission, "diffuse".to_string()));
+        }
+        None
+    }
 }
-
 
 #[derive(Debug, Clone, Copy)]
 pub struct Light {
@@ -459,23 +537,25 @@ impl Light {
 }
 
 impl Emits for Light {
-    fn emit(&self) -> Color  {
+    fn emit(&self) -> Color {
         self.color * f64::powf(self.intensity, 2.0)
     }
 }
 
 impl Scatterable for Light {
-    fn scatter(&self, r_in: &Ray, rec: &HitRecord, lights: &Arc<Vec<Object>>) -> Option<(Ray, Color, Color, String)> {
+    fn scatter(
+        &self,
+        r_in: &Ray,
+        rec: &HitRecord,
+        lights: &Arc<Vec<Object>>,
+    ) -> Option<(Ray, Color, Color, String)> {
         Some((*r_in, Color::black(), self.emit(), "emission".to_string()))
     }
 }
 
-
-
 fn reflect(i: &Vec3, n: &Vec3) -> Vec3 {
-    return *i - *n * 2.0 *i.dot(n);
+    return *i - *n * 2.0 * i.dot(n);
 }
-
 
 fn specular_pdf(cos_theta: f64, refraction_ratio: f64) -> f64 {
     let fresnel = Principle::reflectance(cos_theta, refraction_ratio);
@@ -515,37 +595,37 @@ fn sample_lights(lights: &Arc<Vec<Object>>, point: Vec3) -> Vec3 {
         let (s, t) = (random_float(), random_float());
         let on_light = quad_light.position
             + quad_light.x_axis * (s - 0.5) * quad_light.width
-            + quad_light.y_axis * (t - 0.5) * quad_light.height;  
+            + quad_light.y_axis * (t - 0.5) * quad_light.height;
 
         // Compute the direction to the random point on the light
-        let to_light = on_light - point;    
-    }   
-    return to_light.normalize()
+        let to_light = on_light - point;
+    }
+    return to_light.normalize();
 }
 
 fn ggx_distribution(ndh: f64, roughness: f64) -> f64 {
     let a2: f64 = (roughness * roughness);
-    let d: f64 = ((ndh * a2 - ndh) * ndh + 1.0);//ndh * ndh * (a2 -1.0 ) + 1.0;
-    return a2 / (d * d * PI)
+    let d: f64 = ((ndh * a2 - ndh) * ndh + 1.0); //ndh * ndh * (a2 -1.0 ) + 1.0;
+    return a2 / (d * d * PI);
 }
 
 fn schlick_masking(ndl: f64, ndv: f64, roughness: f64) -> f64 {
     let k: f64 = roughness * roughness / 2.0;
     let g_v: f64 = ndv / (ndv * (1.0 - k) + k);
     let g_l: f64 = ndl / (ndl * (1.0 - k) + k);
-    return g_v * g_l
+    return g_v * g_l;
 }
 
 fn schlick_masking_alt(ndl: f64, ndv: f64, roughness: f64) -> f64 {
     let a2: f64 = roughness * roughness;
     let g_v: f64 = ndl * (ndv * ndv * (1.0 - a2) + a2).sqrt();
     let g_l: f64 = ndv * (ndl * ndl * (1.0 - a2) + a2).sqrt();
-    return 0.5 / (g_v + g_l)
+    return 0.5 / (g_v + g_l);
 }
 
 fn schlick_fresnel(f0: Vec3, ldh: f64) -> Color {
     let f = f0 + (Vec3::ones() - f0) * (1.0 - ldh).powf(5.0);
-    return Color::new(f.x, f.y, f.z, 1.0)
+    return Color::new(f.x, f.y, f.z, 1.0);
 }
 
 fn ggx_sample(roughness: f64, normal: Vec3) -> Vec3 {
@@ -556,7 +636,8 @@ fn ggx_sample(roughness: f64, normal: Vec3) -> Vec3 {
     let cos_theta: f64 = (f64::max(0.0, (1.0 - u) / ((a2 - 1.0) * u + 1.0))).sqrt();
     let sin_theta: f64 = (f64::max(0.0, 1.0 - cos_theta * cos_theta)).sqrt();
     let phi = v * PI * 2.0;
-    let direction = (t * (sin_theta * phi.cos()) + b * (sin_theta * phi.sin()) + normal * cos_theta);
+    let direction =
+        (t * (sin_theta * phi.cos()) + b * (sin_theta * phi.sin()) + normal * cos_theta);
 
     direction
 }
@@ -582,4 +663,3 @@ fn get_perpendicular(vec: Vec3) -> Vec3 {
 
     perp.normalize()
 }
-

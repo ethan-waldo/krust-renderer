@@ -1,43 +1,42 @@
 extern crate num_cpus;
-use crate::render::{ray_color, get_pixel_chunks, render_chunk};
+use crate::aabb::Aabb;
+use crate::buffers::{FrameBuffers, Lobes};
 use crate::bvh::Bvh;
 use crate::camera::Camera;
-use crate::hit::{HitRecord, HittableList, Object, Hittable};
+use crate::color::Color;
+use crate::hit::{HitRecord, Hittable, HittableList, Object};
+use crate::lights::{DirectionalLight, QuadLight};
 use crate::material::{Emits, Light, Material, Principle, Scatterable};
 use crate::ray::Ray;
+use crate::render::{get_pixel_chunks, ray_color, render_chunk};
 use crate::sphere::Sphere;
+use crate::texture::TextureMap;
 use crate::tri::Tri;
 use crate::utility::{random_float, random_range, INF};
-use crate::vec3::Vec3;
 use crate::vec2::Vec2;
-use crate::color::Color;
-use crate::aabb::Aabb;
-use crate::buffers::{Lobes, FrameBuffers};
-use image::{DynamicImage, ImageBuffer, Rgb, Rgba, RgbImage, RgbaImage, Rgb32FImage, Rgba32FImage};
+use crate::vec3::Vec3;
+use image::{DynamicImage, ImageBuffer, Rgb, Rgb32FImage, RgbImage, Rgba, Rgba32FImage, RgbaImage};
 use indicatif::{ProgressBar, ProgressStyle};
+use rayon::prelude::*;
 use serde_json::{Result, Value};
 use show_image::{create_window, ImageInfo, ImageView, WindowOptions};
-use std::io::Write;
 use std::collections::HashMap;
+use std::io::Write;
+use std::mem::drop;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 use std::{env, fs, thread};
-use std::sync::{Arc, Mutex, RwLock};
-use std::mem::drop;
-use crate::texture::TextureMap;
-use rayon::prelude::*;
-use crate::lights::{QuadLight, DirectionalLight};
-
 
 pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
-
     print!("Processing scene...");
     let mut data: serde_json::Value = serde_json::Value::Null;
     if let Some(file) = scene_file {
         let data_read = fs::read_to_string(file).expect("Unable to read render data.");
         data = serde_json::from_str(&data_read).expect("Incorrect JSON format.");
     } else {
-        let data_read = fs::read_to_string("render_data.json").expect("Unable to read render data.");
-        data = serde_json::from_str(&data_read).expect("Incorrect JSON format."); 
+        let data_read =
+            fs::read_to_string("render_data.json").expect("Unable to read render data.");
+        data = serde_json::from_str(&data_read).expect("Incorrect JSON format.");
     }
 
     // extract render settings
@@ -118,13 +117,13 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             mat["diffuse"][0].as_f64().unwrap(),
             mat["diffuse"][1].as_f64().unwrap(),
             mat["diffuse"][2].as_f64().unwrap(),
-            1.0
+            1.0,
         );
         let specular = Color::new(
             mat["specular"][0].as_f64().unwrap(),
             mat["specular"][1].as_f64().unwrap(),
             mat["specular"][2].as_f64().unwrap(),
-            1.0
+            1.0,
         );
         let specular_weight = mat["specular_weight"][0].as_f64().unwrap();
         let ior = mat["ior"].as_f64().unwrap();
@@ -136,16 +135,16 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             mat["emission"][0].as_f64().unwrap(),
             mat["emission"][1].as_f64().unwrap(),
             mat["emission"][2].as_f64().unwrap(),
-            1.0
+            1.0,
         );
         let bump = mat["bump"][0].as_f64().unwrap();
         let bump_strength = mat["bump_strength"].as_f64().unwrap();
         let normal_strength = mat["normal_strength"].as_f64().unwrap();
-        
+
         // textures
         let mut diffuse_tex = None;
         let dt = mat["diffuse_tex"].to_string().replace(['"'], "");
-        if dt != "" {            
+        if dt != "" {
             diffuse_tex = Some(TextureMap::new(&dt, true))
         };
 
@@ -225,7 +224,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             refraction_tex,
             emission_tex,
             bump_tex,
-            normal_tex
+            normal_tex,
         ));
         scene_materials.insert(name, Arc::new(material));
     }
@@ -241,8 +240,8 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             .as_array()
             .unwrap();
         let uv_array = &data["scene"]["meshes"][obj as usize]["uvs"]
-        .as_array()
-        .unwrap();
+            .as_array()
+            .unwrap();
         for i in 0..vtx_array.len() {
             let p0 = Vec3::new(
                 vtx_array[i][0][0].as_f64().unwrap(),
@@ -276,15 +275,15 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             );
             let uv0 = Vec2::new(
                 uv_array[i][0][0].as_f64().unwrap() as f32,
-                uv_array[i][0][1].as_f64().unwrap() as f32
+                uv_array[i][0][1].as_f64().unwrap() as f32,
             );
             let uv1 = Vec2::new(
                 uv_array[i][1][0].as_f64().unwrap() as f32,
-                uv_array[i][1][1].as_f64().unwrap() as f32
+                uv_array[i][1][1].as_f64().unwrap() as f32,
             );
             let uv2 = Vec2::new(
                 uv_array[i][2][0].as_f64().unwrap() as f32,
-                uv_array[i][2][1].as_f64().unwrap() as f32
+                uv_array[i][2][1].as_f64().unwrap() as f32,
             );
             let vertices = vec![p0, p1, p2];
             let normals = vec![n0, n1, n2];
@@ -305,18 +304,18 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
                     normal_array[i][3][0].as_f64().unwrap(),
                     normal_array[i][3][1].as_f64().unwrap(),
                     normal_array[i][3][2].as_f64().unwrap(),
-                ); 
+                );
                 let uv3 = Vec2::new(
                     uv_array[i][3][0].as_f64().unwrap() as f32,
-                    uv_array[i][3][1].as_f64().unwrap() as f32
+                    uv_array[i][3][1].as_f64().unwrap() as f32,
                 );
                 let vertices = vec![p2, p3, p0];
                 let normals = vec![n2, n3, n0];
                 let uvs = vec![uv2, uv3, uv0];
-                let quad_tri = Object::Tri(Tri::new(vertices, normals, uvs, material.clone(), true));
+                let quad_tri =
+                    Object::Tri(Tri::new(vertices, normals, uvs, material.clone(), true));
                 world.objects.push(Arc::new(quad_tri));
             }
-            
         }
     }
 
@@ -343,7 +342,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             data["scene"]["spheres"][obj as usize]["radius"]
                 .as_f64()
                 .unwrap(),
-            scene_materials.get(material_name).unwrap().clone()
+            scene_materials.get(material_name).unwrap().clone(),
         ));
         world.objects.push(Arc::new(new_sphere));
     }
@@ -387,7 +386,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
                 .as_f64()
                 .unwrap();
             let vertices = vec![p0, p1, p2, p3];
-            let light = Object::QuadLight(QuadLight::new(color, intensity, vertices));            
+            let light = Object::QuadLight(QuadLight::new(color, intensity, vertices));
             quad_lights.push(light);
             let vertices = vec![p0, p1, p2, p3];
             let light2 = Object::QuadLight(QuadLight::new(color, intensity, vertices));
@@ -409,24 +408,24 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             .as_f64()
             .unwrap();
         let softness = data["scene"]["lights"]["dir"][obj as usize]["softness"]
-        .as_f64()
-        .unwrap();
+            .as_f64()
+            .unwrap();
         let dir_array = data["scene"]["lights"]["dir"][obj as usize]["direction"]
             .as_array()
             .unwrap();
         let direction = Vec3::new(
-            dir_array[0].as_f64().unwrap(), 
-            dir_array[1].as_f64().unwrap(), 
-            dir_array[2].as_f64().unwrap()
+            dir_array[0].as_f64().unwrap(),
+            dir_array[1].as_f64().unwrap(),
+            dir_array[2].as_f64().unwrap(),
         );
-        let light = DirectionalLight::new(direction, color, intensity, softness);            
+        let light = DirectionalLight::new(direction, color, intensity, softness);
         dir_lights.push(light);
     }
 
     let quad_lights = Arc::new(quad_lights);
     let dir_lights = Arc::new(dir_lights);
 
-    println!("Processing BVH..."); 
+    println!("Processing BVH...");
     let world_bvh = Arc::new(Object::Bvh(Bvh::new(&mut world.objects, 0.0, 1.0)));
 
     //----------------------------------------------------------------------------------
@@ -438,18 +437,24 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
 
     let progress = ProgressBar::new((spp - 1) as u64).with_message("%...");
     progress.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.gray} {percent}{msg}")
-            .unwrap(),
+        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.gray} {percent}{msg}").unwrap(),
     );
 
-    let pixel_chunks = Arc::new(get_pixel_chunks(64 as usize, width as usize, height as usize)); 
+    let pixel_chunks = Arc::new(get_pixel_chunks(
+        64 as usize,
+        width as usize,
+        height as usize,
+    ));
     let num_threads = num_cpus::get();
     let thread_chunk_size = (pixel_chunks.len() as f32 / num_threads as f32).ceil() as usize;
     for sample in 0..spp {
         if sample != 0 {
             progress.inc(1);
         }
-        let skydome_texture = Arc::new(TextureMap::new("g:/rust_projects/krrust/textures/alley_01.jpg", true));
+        let skydome_texture = Arc::new(TextureMap::new(
+            "g:/rust_projects/krrust/textures/alley_01.jpg",
+            true,
+        ));
         let mut handles = Vec::with_capacity(num_threads);
         for chunk in pixel_chunks.chunks(thread_chunk_size).map(|c| c.to_vec()) {
             let camera = camera.clone();
@@ -458,23 +463,26 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             let dir_lights = dir_lights.clone();
             let sky = skydome_texture.clone();
             let handle = thread::spawn(move || {
-                let result = chunk.iter().map(|c|
-                    render_chunk(
-                        c,
-                        height,
-                        width,
-                        &sample,
-                        &camera,
-                        &world_bvh,
-                        &quad_lights,
-                        &dir_lights,
-                        depth,
-                        depth,
-                        progressive,
-                        &None,//&Some(sky.clone()),
-                        false,
+                let result = chunk
+                    .iter()
+                    .map(|c| {
+                        render_chunk(
+                            c,
+                            height,
+                            width,
+                            &sample,
+                            &camera,
+                            &world_bvh,
+                            &quad_lights,
+                            &dir_lights,
+                            depth,
+                            depth,
+                            progressive,
+                            &None, //&Some(sky.clone()),
+                            false,
                         )
-                    ).collect::<Vec<Vec<(u32, u32, Lobes)>>>();
+                    })
+                    .collect::<Vec<Vec<(u32, u32, Lobes)>>>();
                 result
             });
             handles.push(handle);
@@ -483,25 +491,17 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
         for handle in handles {
             let thread_result = handle.join().unwrap();
             for chunk_result in thread_result.iter() {
-                for pixel in chunk_result{
-                    let (x, y, color) = (pixel.0, pixel.1, pixel.2);
-                    let (mut rgba, mut diff, mut spec) = (color.rgba, color.diffuse, color.specular);
-                    let previous = buffers.get_pixel(x, y);
-                    let (previous_rgba, previous_diff, previous_spec) = (
-                        previous.rgba, 
-                        previous.diffuse, 
-                        previous.specular
-                    );
+                for pixel in chunk_result {
+                    let (x, y, mut color) = (pixel.0, pixel.1, pixel.2);
 
                     // average in new sample
                     if sample > 0 {
-                        let average = (sample + 1) as f64;
-                        rgba = (rgba + (previous_rgba * sample as f64)) / average;
-                        diff = (diff + (previous_diff * sample as f64)) / average;
-                        spec = (spec + (previous_spec * sample as f64)) / average;
+                        color = color.average_with_previous(buffers.get_pixel(x, y), sample as f64);
                     }
 
-                    buffers.put_pixel(x, y, rgba, diff, spec);
+                    buffers.put_pixel(x, y, color);
+                    let rgba = color.rgba;
+                    let diff = color.diffuse;
                     preview.put_pixel(
                         x,
                         y,
