@@ -1,18 +1,18 @@
-use crate::vec3::Vec3;
-use crate::vec2::Vec2;
 use crate::ray::Ray;
 use crate::sphere::Sphere;
 use crate::tri::Tri;
+use crate::vec2::Vec2;
+use crate::vec3::Vec3;
 // use crate::trimesh::TriMesh;
-use crate::material::{Material, Principle};
 use crate::aabb::Aabb;
 use crate::bvh::Bvh;
-use std::sync::Arc;
 use crate::lights::QuadLight;
-
+use crate::material::{Material, Principle};
+use std::sync::Arc;
 
 #[derive(Clone)]
-pub enum Object{
+#[allow(dead_code)]
+pub enum Object {
     Sphere(Sphere),
     Tri(Tri),
     QuadLight(QuadLight),
@@ -22,21 +22,31 @@ pub enum Object{
     HittableList(HittableList),
 }
 
-impl Object{
-    pub fn empty() -> Object  {
+impl Object {
+    #[allow(dead_code)]
+    pub fn empty() -> Object {
         let mat = Arc::new(Material::Principle(Principle::default()));
-        Object::Sphere(Sphere::new(Vec3::black(), Vec3::black(), 0.0, 1.0, 0.001, mat))
+        Object::Sphere(Sphere::new(
+            Vec3::black(),
+            Vec3::black(),
+            0.0,
+            1.0,
+            0.001,
+            mat,
+        ))
     }
 }
 
 pub trait Hittable {
     fn hit(&self, ray: &Ray, t_min: f64, t_max: f64) -> (bool, Option<HitRecord>);
 
-    fn pdf_value(&self, o: &Vec3, v: &Vec3) -> f64 {
+    #[allow(dead_code)]
+    fn pdf_value(&self, _o: &Vec3, _v: &Vec3) -> f64 {
         0.0
     }
 
-    fn random(&self, o: &Vec3) -> Vec3 {
+    #[allow(dead_code)]
+    fn random(&self, _o: &Vec3) -> Vec3 {
         Vec3::new(1.0, 0.0, 0.0)
     }
 }
@@ -57,7 +67,7 @@ impl Hittable for Object {
     fn pdf_value(&self, o: &Vec3, v: &Vec3) -> f64 {
         match self {
             Object::QuadLight(ql) => ql.pdf_value(o, v),
-            _=> {0.0}
+            _ => 0.0,
         }
     }
 }
@@ -90,11 +100,17 @@ pub struct HitRecord {
 }
 
 impl HitRecord {
-    pub fn hit_world(world: &[Object], r: &Ray, t_min: f64, t_max: f64) -> (bool, Option<HitRecord>) {
+    #[allow(dead_code)]
+    pub fn hit_world(
+        world: &[Object],
+        r: &Ray,
+        t_min: f64,
+        t_max: f64,
+    ) -> (bool, Option<HitRecord>) {
         let mut t_nearest = t_max;
         let mut hit_record = (false, None);
         for obj in world {
-            if let (bool, Some(hit)) = obj.hit(r, t_min, t_nearest) {
+            if let (_hit, Some(hit)) = obj.hit(r, t_min, t_nearest) {
                 t_nearest = hit.t;
                 hit_record = (true, Some(hit));
             }
@@ -104,20 +120,21 @@ impl HitRecord {
 }
 #[derive(Clone)]
 pub struct HittableList {
-    pub objects: Vec<Arc<Object>>
+    pub objects: Vec<Arc<Object>>,
 }
 
 impl HittableList {
     pub fn new() -> HittableList {
-        HittableList{objects: Vec::new()}
+        HittableList {
+            objects: Vec::new(),
+        }
     }
-
 
     pub fn hit(&self, r: &Ray, t_min: f64, t_max: f64) -> (bool, Option<HitRecord>) {
         let mut t_nearest = t_max;
         let mut hit_record = (false, None);
         for obj in &self.objects {
-            if let (bool, Some(hit)) = obj.hit(r, t_min, t_nearest) {
+            if let (_hit, Some(hit)) = obj.hit(r, t_min, t_nearest) {
                 t_nearest = hit.t;
                 hit_record = (true, Some(hit));
             }
@@ -125,23 +142,20 @@ impl HittableList {
         hit_record
     }
 
-    pub fn bounding_box(&self, time0: f64, time1: f64) ->Aabb {  
-        let mut output_box: Aabb = Aabb::new(Vec3::black()*0.0001, Vec3::black()*0.001);
+    pub fn bounding_box(&self, time0: f64, time1: f64) -> Aabb {
+        let mut output_box: Aabb = Aabb::new(Vec3::black() * 0.0001, Vec3::black() * 0.001);
         for object in &self.objects {
             output_box = Aabb::surrounding_box(output_box, object.bounding_box(time0, time1));
         }
         output_box
     }
 
+    #[allow(dead_code)]
     pub fn new_from_vec(obj_vec: Vec<Arc<Object>>) -> HittableList {
         let mut list = Vec::new();
         for obj in obj_vec {
             list.push(obj);
         }
-        HittableList{ objects: list }
+        HittableList { objects: list }
     }
-
 }
-
-
-

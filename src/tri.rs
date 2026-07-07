@@ -1,13 +1,10 @@
+use crate::aabb::Aabb;
 use crate::hit::HitRecord;
 use crate::material::Material;
 use crate::ray::Ray;
-use crate::vec3::Vec3;
 use crate::vec2::Vec2;
-use crate::aabb::Aabb;
-use crate::color::Color;
-use crate::texture::TextureMap;
+use crate::vec3::Vec3;
 use std::sync::Arc;
-
 
 #[derive(Debug, Clone)]
 pub struct Tri {
@@ -20,8 +17,14 @@ pub struct Tri {
 }
 
 impl Tri {
-    pub fn new(vertices: Vec<Vec3>, normals: Vec<Vec3>, uvs: Vec<Vec2>, material: Arc<Material>, smooth: bool) -> Tri {
-        let a = Vec3::cross(&(vertices[1]-vertices[0]), &(vertices[2]-vertices[0]));
+    pub fn new(
+        vertices: Vec<Vec3>,
+        normals: Vec<Vec3>,
+        uvs: Vec<Vec2>,
+        material: Arc<Material>,
+        smooth: bool,
+    ) -> Tri {
+        let a = Vec3::cross(&(vertices[1] - vertices[0]), &(vertices[2] - vertices[0]));
         let area = (a.x.abs().powf(2.0) + a.y.abs().powf(2.0) + a.z.abs().powf(2.0)).sqrt();
 
         Tri {
@@ -59,23 +62,28 @@ impl Tri {
         if t > EPSILON {
             if t < t_max && t > t_min {
                 let p = r.at(t);
-                let mut normal: Vec3;
+                let normal: Vec3;
                 let uv = (self.uvs[0] * (1.0 - u - v)) + (self.uvs[1] * u) + (self.uvs[2] * v);
                 if self.smooth {
-                    normal = ((self.normals[0] * (1.0-u-v)) + (self.normals[1] * u) + (self.normals[2] * v)).normalize();
+                    normal = ((self.normals[0] * (1.0 - u - v))
+                        + (self.normals[1] * u)
+                        + (self.normals[2] * v))
+                        .normalize();
                 } else {
                     normal = (&edge1).cross(&edge2).normalize();
                 }
                 let front_face = normal.dot(&r.direction) < 0.0;
-                return (true,
-                Some(HitRecord {
-                    t,
-                    point: p,
-                    normal: if front_face {normal} else {-normal},
-                    uv,
-                    front_face,
-                    material: self.material.clone(),
-                }));                
+                return (
+                    true,
+                    Some(HitRecord {
+                        t,
+                        point: p,
+                        normal: if front_face { normal } else { -normal },
+                        uv,
+                        front_face,
+                        material: self.material.clone(),
+                    }),
+                );
             }
         } else {
             return (false, None);
@@ -83,7 +91,7 @@ impl Tri {
         (false, None)
     }
 
-    pub fn bounding_box(&self, time0: f64, time1: f64) -> Aabb {
+    pub fn bounding_box(&self, _time0: f64, _time1: f64) -> Aabb {
         let pad = 0.001;
         let (v0, v1, v2) = (self.vertices[0], self.vertices[1], self.vertices[2]);
         let min_x = f64::min(v0.x - pad, f64::min(v1.x - pad, v2.x - pad));
@@ -97,4 +105,3 @@ impl Tri {
         Aabb::new(min, max)
     }
 }
-

@@ -1,12 +1,9 @@
 use crate::color::Color;
-use crate::hit::{HitRecord, Hittable, HittableList, Object};
-use crate::lights::QuadLight;
-use crate::onb::Onb;
+use crate::hit::{HitRecord, Object};
 use crate::pdf::{CosinePdf, LightPdf, Pdf};
 use crate::ray::Ray;
 use crate::texture::TextureMap;
-use crate::utility::{clamp, random_float, random_int, INF};
-use crate::vec2::Vec2;
+use crate::utility::{clamp, random_float};
 use crate::vec3::Vec3;
 use std::f64::consts::PI;
 use std::sync::Arc;
@@ -73,6 +70,7 @@ impl Emits for Material {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Principle {
     pub diffuse: Color,
     pub diffuse_weight: f64,
@@ -149,6 +147,7 @@ impl Principle {
         }
     }
 
+    #[allow(dead_code)]
     pub fn default() -> Self {
         Self {
             diffuse: Color::black(),
@@ -176,13 +175,14 @@ impl Principle {
         }
     }
 
+    #[allow(dead_code)]
     pub fn reflectance(cosine: f64, ref_idx: f64) -> f64 {
         let mut r0 = (1.0 - ref_idx) / (1.0 + ref_idx);
         r0 = r0 * r0;
         r0 + (1.0 - r0) * f64::powi(1.0 - cosine, 5)
     }
 
-    pub fn scatter_pdf(r_in: &Ray, rec: &HitRecord, scattered: &Ray) -> f64 {
+    pub fn scatter_pdf(_r_in: &Ray, rec: &HitRecord, scattered: &Ray) -> f64 {
         let cosine = Vec3::dot(&rec.normal, &scattered.direction.normalize());
         return if cosine < 0.0 { 0.0 } else { cosine / PI };
     }
@@ -226,7 +226,7 @@ impl Scatterable for Principle {
     ) -> Option<(Ray, Color, Color, String)> {
         // sample textures if available
         let mut diffuse = self.diffuse;
-        if let Some(d) = &self.diffuse_texture {
+        if self.diffuse_texture.is_some() {
             diffuse = self
                 .diffuse_texture
                 .as_ref()
@@ -235,7 +235,7 @@ impl Scatterable for Principle {
         }
 
         let mut diffuse_weight = self.diffuse_weight;
-        if let Some(dwt) = &self.diffuse_weight_texture {
+        if self.diffuse_weight_texture.is_some() {
             diffuse_weight = self
                 .diffuse_weight_texture
                 .as_ref()
@@ -245,7 +245,7 @@ impl Scatterable for Principle {
         }
 
         let mut specular = self.specular;
-        if let Some(st) = &self.specular_texture {
+        if self.specular_texture.is_some() {
             specular = self
                 .specular_texture
                 .as_ref()
@@ -254,7 +254,7 @@ impl Scatterable for Principle {
         }
 
         let mut specular_weight = self.specular_weight;
-        if let Some(swt) = &self.specular_weight_texture {
+        if self.specular_weight_texture.is_some() {
             specular_weight = self
                 .specular_weight_texture
                 .as_ref()
@@ -264,7 +264,7 @@ impl Scatterable for Principle {
         }
 
         let mut roughness = self.roughness;
-        if let Some(rt) = &self.roughness_texture {
+        if self.roughness_texture.is_some() {
             roughness = self
                 .roughness_texture
                 .as_ref()
@@ -274,7 +274,7 @@ impl Scatterable for Principle {
         }
 
         let mut metallic = self.metallic;
-        if let Some(mt) = &self.metallic_texture {
+        if self.metallic_texture.is_some() {
             metallic = self
                 .metallic_texture
                 .as_ref()
@@ -284,7 +284,7 @@ impl Scatterable for Principle {
         }
 
         let mut refraction = self.refraction;
-        if let Some(rft) = &self.refraction_texture {
+        if self.refraction_texture.is_some() {
             refraction = self
                 .refraction_texture
                 .as_ref()
@@ -294,7 +294,7 @@ impl Scatterable for Principle {
         }
 
         let mut emission = self.emission;
-        if let Some(et) = &self.emission_texture {
+        if self.emission_texture.is_some() {
             emission = self
                 .emission_texture
                 .as_ref()
@@ -302,15 +302,9 @@ impl Scatterable for Principle {
                 .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0));
         }
 
-        let mut bump = 0.0;
         let mut bump_gradient = Color::black();
         let mut has_bump = false;
-        if let Some(et) = &self.bump_texture {
-            bump = self
-                .bump_texture
-                .as_ref()
-                .map(|t| t.sample(rec.uv.x, rec.uv.y).r)
-                .unwrap_or_else(|| 0.0);
+        if self.bump_texture.is_some() {
             bump_gradient = self
                 .bump_texture
                 .as_ref()
@@ -321,7 +315,7 @@ impl Scatterable for Principle {
 
         let mut has_normal = false;
         let mut normal_map = Color::black();
-        if let Some(nm) = &self.normal_texture {
+        if self.normal_texture.is_some() {
             normal_map = self
                 .normal_texture
                 .as_ref()
@@ -352,10 +346,8 @@ impl Scatterable for Principle {
 
         // light pdf
         let mut to_light = Vec3::zeros();
-        let mut on_light = Vec3::zeros();
         let mut sum_pdf = 0.0;
-        let mut pdf_val = 0.0;
-        for (i, light) in lights.iter().enumerate() {
+        for light in lights.iter() {
             match light {
                 Object::QuadLight(quad_light) => {
                     let distance_squared = (quad_light.position - rec.point).length_squared();
@@ -367,14 +359,13 @@ impl Scatterable for Principle {
 
         // pick a light
         let mut chosen_light = None;
-        for (i, light) in lights.iter().enumerate() {
+        for light in lights.iter() {
             match light {
                 Object::QuadLight(quad_light) => {
                     let distance_squared = (quad_light.position - rec.point).length_squared();
                     let pdf = quad_light.area / distance_squared;
                     if chosen_light.is_none() && random_float() < pdf / sum_pdf {
                         chosen_light = Some(quad_light);
-                        pdf_val = pdf / sum_pdf;
                     }
                 }
                 _ => {}
@@ -385,7 +376,7 @@ impl Scatterable for Principle {
         if let Some(quad_light) = chosen_light {
             // pick a random point on the chosen light
             let (s, t) = (random_float(), random_float());
-            on_light = quad_light.position
+            let on_light = quad_light.position
                 + quad_light.x_axis * (s - 0.5) * quad_light.width
                 + quad_light.y_axis * (t - 0.5) * quad_light.height;
 
@@ -398,12 +389,11 @@ impl Scatterable for Principle {
         diffuse_weight = clamp(diffuse_weight - metallic - refraction, 0.0, 1.0);
         let metal = metallic > roll;
         let refract = refraction > roll * 2.0;
-        let mut specular_prob = specular_weight / (specular_weight + diffuse_weight);
+        let specular_prob = specular_weight / (specular_weight + diffuse_weight);
 
         // refraction
         if refract {
             let cos_theta = f64::min(Vec3::dot(&(unit_direction * -1.0), &perturbed_normal), 1.0);
-            let sin_theta = (1.0 - cos_theta * cos_theta).sqrt();
             let refraction_ratio = if cos_theta > 0.0 {
                 if rec.front_face {
                     1.0 / self.ior
@@ -443,8 +433,6 @@ impl Scatterable for Principle {
             let r = if roughness == 0.0 { 0.001 } else { roughness };
             let v = -r_in.direction.normalize();
             let mut n = perturbed_normal.normalize();
-            let mut l = n;
-            let mut h = n;
 
             // on axis check
             let t = 0.02;
@@ -457,15 +445,17 @@ impl Scatterable for Principle {
 
             // determine direction of reflected ray
             let direct = random_float() < 0.5;
-            if direct {
+            let (l, h) = if direct {
                 // sample a light
-                l = to_light;
-                h = (v + l).normalize();
+                let l = to_light;
+                let h = (v + l).normalize();
+                (l, h)
             } else {
                 // sample random ggx vector
-                h = ggx_sample(r, n).normalize();
-                l = (2.0 * v.dot(&h) * h - v).normalize();
-            }
+                let h = ggx_sample(r, n).normalize();
+                let l = (2.0 * v.dot(&h) * h - v).normalize();
+                (l, h)
+            };
 
             // scattered ray
             let scattered = Ray::new(rec.point, l, r_in.time);
@@ -481,7 +471,7 @@ impl Scatterable for Principle {
             let d: f64 = ggx_distribution(ndh, r);
             let g: f64 = schlick_masking(ndl, ndv, r);
             let f: Color = schlick_fresnel(f0, ldh);
-            let ggx = f * g * d / f64::max((4.0 * ndv * ndl), 0.015);
+            let ggx = f * g * d / f64::max(4.0 * ndv * ndl, 0.015);
 
             // compute weights
             let light_pdf = LightPdf::new(lights.clone(), rec.point, rec.normal);
@@ -520,7 +510,6 @@ impl Scatterable for Principle {
 
             return Some((scattered, attenuation, emission, "diffuse".to_string()));
         }
-        None
     }
 }
 
@@ -546,26 +535,29 @@ impl Scatterable for Light {
     fn scatter(
         &self,
         r_in: &Ray,
-        rec: &HitRecord,
-        lights: &Arc<Vec<Object>>,
+        _rec: &HitRecord,
+        _lights: &Arc<Vec<Object>>,
     ) -> Option<(Ray, Color, Color, String)> {
         Some((*r_in, Color::black(), self.emit(), "emission".to_string()))
     }
 }
 
+#[allow(dead_code)]
 fn reflect(i: &Vec3, n: &Vec3) -> Vec3 {
     return *i - *n * 2.0 * i.dot(n);
 }
 
+#[allow(dead_code)]
 fn specular_pdf(cos_theta: f64, refraction_ratio: f64) -> f64 {
     let fresnel = Principle::reflectance(cos_theta, refraction_ratio);
     fresnel / std::f64::consts::PI
 }
 
+#[allow(dead_code)]
 fn sample_lights(lights: &Arc<Vec<Object>>, point: Vec3) -> Vec3 {
-    let mut to_light = Vec3::zeros();
+    let to_light = Vec3::zeros();
     let mut sum_pdf = 0.0;
-    for (i, light) in lights.iter().enumerate() {
+    for light in lights.iter() {
         match light {
             Object::QuadLight(quad_light) => {
                 let distance_squared = (quad_light.position - point).length_squared();
@@ -576,7 +568,7 @@ fn sample_lights(lights: &Arc<Vec<Object>>, point: Vec3) -> Vec3 {
     }
 
     let mut chosen_light = None;
-    for (i, light) in lights.iter().enumerate() {
+    for light in lights.iter() {
         match light {
             Object::QuadLight(quad_light) => {
                 let distance_squared = (quad_light.position - point).length_squared();
@@ -598,14 +590,14 @@ fn sample_lights(lights: &Arc<Vec<Object>>, point: Vec3) -> Vec3 {
             + quad_light.y_axis * (t - 0.5) * quad_light.height;
 
         // Compute the direction to the random point on the light
-        let to_light = on_light - point;
+        let _to_light = on_light - point;
     }
     return to_light.normalize();
 }
 
 fn ggx_distribution(ndh: f64, roughness: f64) -> f64 {
-    let a2: f64 = (roughness * roughness);
-    let d: f64 = ((ndh * a2 - ndh) * ndh + 1.0); //ndh * ndh * (a2 -1.0 ) + 1.0;
+    let a2: f64 = roughness * roughness;
+    let d: f64 = (ndh * a2 - ndh) * ndh + 1.0; //ndh * ndh * (a2 -1.0 ) + 1.0;
     return a2 / (d * d * PI);
 }
 
@@ -616,6 +608,7 @@ fn schlick_masking(ndl: f64, ndv: f64, roughness: f64) -> f64 {
     return g_v * g_l;
 }
 
+#[allow(dead_code)]
 fn schlick_masking_alt(ndl: f64, ndv: f64, roughness: f64) -> f64 {
     let a2: f64 = roughness * roughness;
     let g_v: f64 = ndl * (ndv * ndv * (1.0 - a2) + a2).sqrt();
@@ -636,8 +629,7 @@ fn ggx_sample(roughness: f64, normal: Vec3) -> Vec3 {
     let cos_theta: f64 = (f64::max(0.0, (1.0 - u) / ((a2 - 1.0) * u + 1.0))).sqrt();
     let sin_theta: f64 = (f64::max(0.0, 1.0 - cos_theta * cos_theta)).sqrt();
     let phi = v * PI * 2.0;
-    let direction =
-        (t * (sin_theta * phi.cos()) + b * (sin_theta * phi.sin()) + normal * cos_theta);
+    let direction = t * (sin_theta * phi.cos()) + b * (sin_theta * phi.sin()) + normal * cos_theta;
 
     direction
 }

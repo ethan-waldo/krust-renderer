@@ -1,43 +1,35 @@
 extern crate num_cpus;
-use crate::aabb::Aabb;
 use crate::buffers::{FrameBuffers, Lobes};
 use crate::bvh::Bvh;
 use crate::camera::Camera;
 use crate::color::Color;
-use crate::hit::{HitRecord, Hittable, HittableList, Object};
+use crate::hit::{HittableList, Object};
 use crate::lights::{DirectionalLight, QuadLight};
-use crate::material::{Emits, Light, Material, Principle, Scatterable};
-use crate::ray::Ray;
-use crate::render::{get_pixel_chunks, ray_color, render_chunk};
+use crate::material::{Material, Principle};
+use crate::render::{get_pixel_chunks, render_chunk};
 use crate::sphere::Sphere;
 use crate::texture::TextureMap;
 use crate::tri::Tri;
-use crate::utility::{random_float, random_range, INF};
 use crate::vec2::Vec2;
 use crate::vec3::Vec3;
-use image::{DynamicImage, ImageBuffer, Rgb, Rgb32FImage, RgbImage, Rgba, Rgba32FImage, RgbaImage};
+use image::{ImageBuffer, Rgba, Rgba32FImage, RgbaImage};
 use indicatif::{ProgressBar, ProgressStyle};
-use rayon::prelude::*;
-use serde_json::{Result, Value};
 use show_image::{create_window, ImageInfo, ImageView, WindowOptions};
 use std::collections::HashMap;
 use std::io::Write;
-use std::mem::drop;
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
-use std::{env, fs, thread};
+use std::sync::Arc;
+use std::{fs, thread};
 
 pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     print!("Processing scene...");
-    let mut data: serde_json::Value = serde_json::Value::Null;
-    if let Some(file) = scene_file {
+    let data: serde_json::Value = if let Some(file) = scene_file {
         let data_read = fs::read_to_string(file).expect("Unable to read render data.");
-        data = serde_json::from_str(&data_read).expect("Incorrect JSON format.");
+        serde_json::from_str(&data_read).expect("Incorrect JSON format.")
     } else {
         let data_read =
             fs::read_to_string("render_data.json").expect("Unable to read render data.");
-        data = serde_json::from_str(&data_read).expect("Incorrect JSON format.");
-    }
+        serde_json::from_str(&data_read).expect("Incorrect JSON format.")
+    };
 
     // extract render settings
     let progressive = data["settings"]["progressive"].as_u64().unwrap() == 1;
@@ -91,11 +83,10 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             .set_borderless(false)
             .set_show_overlays(true),
     );
-    window
+    let _ = window
         .as_ref()
         .expect("REASON")
         .set_image("image-001", render_view);
-    let preview_output = "g:/krrusty_output_new.png";
     let mut output = data["settings"]["output_file"].to_string();
     output.pop();
     output.remove(0);
@@ -107,7 +98,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     let mut dir_lights: Vec<DirectionalLight> = vec![];
 
     // get materials
-    std::io::stdout().flush();
+    let _ = std::io::stdout().flush();
     println!("\rProcessing materials...");
     let mut scene_materials: HashMap<String, Arc<Material>> = HashMap::new();
     let material_array = &data["scene"]["materials"].as_array().unwrap();
@@ -461,7 +452,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             let world_bvh = world_bvh.clone();
             let quad_lights = quad_lights.clone();
             let dir_lights = dir_lights.clone();
-            let sky = skydome_texture.clone();
+            let _sky = skydome_texture.clone();
             let handle = thread::spawn(move || {
                 let result = chunk
                     .iter()
@@ -492,14 +483,8 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             let thread_result = handle.join().unwrap();
             for chunk_result in thread_result.iter() {
                 for pixel in chunk_result {
-                    let (x, y, mut color) = (pixel.0, pixel.1, pixel.2);
-
-                    // average in new sample
-                    if sample > 0 {
-                        color = color.average_with_previous(buffers.get_pixel(x, y), sample as f64);
-                    }
-
-                    buffers.put_pixel(x, y, color);
+                    let (x, y, color) = (pixel.0, pixel.1, pixel.2);
+                    let color = buffers.accumulate_pixel(x, y, sample, color);
                     let rgba = color.rgba;
                     let diff = color.diffuse;
                     preview.put_pixel(
@@ -526,11 +511,11 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             }
         }
         let render_view = ImageView::new(ImageInfo::rgba8(width, height), &preview);
-        window
+        let _ = window
             .as_ref()
             .expect("REASON")
             .set_image("image-001", render_view);
-        preview.save(&output_file);
+        let _ = preview.save(&output_file);
     }
     // buffers.rgba.save(&output);
     ProgressBar::finish_with_message(&progress, "% Render complete")

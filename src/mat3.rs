@@ -1,5 +1,5 @@
-use std::ops::Mul;
 use crate::vec3::Vec3;
+use std::ops::Mul;
 
 #[derive(Copy, Clone, Debug)]
 pub struct Mat3 {
@@ -22,6 +22,7 @@ impl Mat3 {
         Mat3 { m }
     }
 
+    #[allow(dead_code)]
     pub fn transpose(&self) -> Self {
         let mut res = Mat3::new([[0.0; 3]; 3]);
         for i in 0..3 {

@@ -1,11 +1,8 @@
 use crate::hit::HitRecord;
-use crate::hit::Hittable;
-use crate::material::{Material, Light};
 use crate::ray::Ray;
 use crate::vec3::Vec3;
 use std::f64;
 use std::mem;
-
 
 #[derive(Debug, Clone, Copy)]
 pub struct Aabb {
@@ -18,6 +15,7 @@ impl Aabb {
         Aabb { min, max }
     }
 
+    #[allow(dead_code)]
     pub fn empty() -> Aabb {
         Aabb {
             min: Vec3::new(f64::INFINITY, f64::INFINITY, f64::INFINITY),
@@ -25,7 +23,7 @@ impl Aabb {
         }
     }
 
-    pub fn bounding_box(&self, time0: f64, time1: f64) -> Aabb {
+    pub fn bounding_box(&self, _time0: f64, _time1: f64) -> Aabb {
         Self::surrounding_box(*self, *self)
     }
 

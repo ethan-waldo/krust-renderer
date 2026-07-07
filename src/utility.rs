@@ -15,14 +15,19 @@ pub fn random_float() -> f64 {
 }
 
 pub fn random_range(min: f64, max: f64) -> f64 {
-    min + (max-min) * random_float()
+    min + (max - min) * random_float()
 }
+#[allow(dead_code)]
 pub fn random_int(min: f64, max: f64) -> i32 {
-    random_range(min, max+1.0) as i32
+    random_range(min, max + 1.0) as i32
 }
 
 pub fn clamp(x: f64, min: f64, max: f64) -> f64 {
-    if x > max {return max}
-    if x < min {return min}
+    if x > max {
+        return max;
+    }
+    if x < min {
+        return min;
+    }
     x
 }

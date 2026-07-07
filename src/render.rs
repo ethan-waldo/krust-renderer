@@ -1,20 +1,15 @@
-use crate::aabb::Aabb;
-use crate::buffers::{FrameBuffers, Lobes};
-use crate::bvh::Bvh;
+use crate::buffers::Lobes;
 use crate::camera::Camera;
 use crate::color::Color;
-use crate::hit::{HitRecord, Hittable, HittableList, Object};
+use crate::hit::{Hittable, Object};
 use crate::lights::DirectionalLight;
-use crate::material::{Emits, Light, Material, Principle, Scatterable};
+use crate::material::{Material, Scatterable};
 use crate::ray::Ray;
 use crate::texture::TextureMap;
 use crate::utility::{random_float, INF};
 use crate::vec3::Vec3;
-use image::{ImageBuffer, Rgb, Rgb32FImage, RgbImage, Rgba, Rgba32FImage, RgbaImage};
 use std::f64::consts::PI;
-use std::io::Write;
-use std::sync::{Arc, Mutex, RwLock};
-use std::{env, fs, thread};
+use std::sync::Arc;
 
 pub fn ray_color(
     r: &Ray,
@@ -70,13 +65,9 @@ pub fn ray_color(
             color.emission = emission;
 
             // material properties
-            let mut diffuse_weight = 0.0;
-            let mut specular_weight = 0.0;
-            let mut roughness = 0.0;
-
             if let Material::Principle(principle) = &*hit_rec.material {
-                diffuse_weight = principle.diffuse_weight;
-                if let Some(dwt) = &principle.diffuse_weight_texture {
+                let mut diffuse_weight = principle.diffuse_weight;
+                if principle.diffuse_weight_texture.is_some() {
                     diffuse_weight = principle
                         .diffuse_weight_texture
                         .as_ref()
@@ -84,8 +75,8 @@ pub fn ray_color(
                         .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0))
                         .r;
                 }
-                specular_weight = principle.specular_weight;
-                if let Some(rt) = &principle.specular_weight_texture {
+                let mut specular_weight = principle.specular_weight;
+                if principle.specular_weight_texture.is_some() {
                     specular_weight = principle
                         .specular_weight_texture
                         .as_ref()
@@ -93,8 +84,8 @@ pub fn ray_color(
                         .unwrap_or_else(|| Color::new(0.0, 1.0, 1.0, 1.0))
                         .r;
                 }
-                roughness = principle.roughness;
-                if let Some(rt) = &principle.roughness_texture {
+                let mut roughness = principle.roughness;
+                if principle.roughness_texture.is_some() {
                     roughness = principle
                         .roughness_texture
                         .as_ref()
@@ -141,7 +132,7 @@ pub fn ray_color(
             let theta = (-unit_direction.y).asin();
             let u = 1.0 - (phi + PI) / (2.0 * PI);
             let v = 1.0 - (theta + PI / 2.0) / PI;
-            let mut sky_color = sky.sample(u as f32, v as f32);
+            let sky_color = sky.sample(u as f32, v as f32);
 
             if depth == max_depth && hide_skydome {
                 return Lobes::empty();
@@ -159,7 +150,7 @@ pub fn ray_color(
             let unit_direction = Vec3::normalize(&r.direction);
             let t = 0.5 * (unit_direction.y() + 1.0);
             let gradient_color = Color::new(0.63, 0.75, 1.0, if hide_skydome { 0.0 } else { 1.0 });
-            let gradient = Color::new(1.0, 1.0, 1.0, if hide_skydome { 0.0 } else { 1.0 })
+            let _gradient = Color::new(1.0, 1.0, 1.0, if hide_skydome { 0.0 } else { 1.0 })
                 * (1.0 - t)
                 + gradient_color * t;
             return Lobes {
@@ -195,7 +186,7 @@ pub fn render_chunk(
     pixel_chunks: &Vec<(u32, u32)>,
     height: u32,
     width: u32,
-    sample: &u16,
+    _sample: &u16,
     camera: &Arc<Camera>,
     bvh: &Object,
     quad_lights: &Arc<Vec<Object>>,

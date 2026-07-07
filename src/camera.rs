@@ -1,7 +1,8 @@
-use crate::vec3::Vec3;
 use crate::ray::Ray;
 use crate::utility::{degrees_to_radians, random_range};
+use crate::vec3::Vec3;
 
+#[allow(dead_code)]
 pub struct Camera {
     pub fov: f64,
     pub aspect_ratio: f64,
@@ -16,7 +17,6 @@ pub struct Camera {
     lower_left_corner: Vec3,
     u: Vec3,
     v: Vec3,
-    
 }
 
 impl Camera {
@@ -30,10 +30,10 @@ impl Camera {
         time0: f64,
         time1: f64,
     ) -> Camera {
-        let focus_distance = (origin-focus).length();
-        let vup = Vec3::new(0.0,1.0,0.0);
+        let focus_distance = (origin - focus).length();
+        let vup = Vec3::new(0.0, 1.0, 0.0);
         let theta = degrees_to_radians(fov);
-        let h = f64::tan(theta/2.0);
+        let h = f64::tan(theta / 2.0);
         let viewport_height: f64 = 2.0 * h;
         let viewport_width: f64 = aspect_ratio * viewport_height;
 
@@ -42,18 +42,17 @@ impl Camera {
         let v = Vec3::cross(&w, &u);
 
         let horizontal = u * viewport_width * focus_distance;
-        let vertical  = v * viewport_height * focus_distance;
-        let lower_left_corner =
-        origin - horizontal / 2.0 - vertical / 2.0 - w * focus_distance;
+        let vertical = v * viewport_height * focus_distance;
+        let lower_left_corner = origin - horizontal / 2.0 - vertical / 2.0 - w * focus_distance;
 
-        Camera{
+        Camera {
             fov,
             aspect_ratio,
             aperature,
             origin,
             aim,
             focus,
-            time0, 
+            time0,
             time1,
             horizontal,
             vertical,
@@ -67,10 +66,9 @@ impl Camera {
         let rd = Vec3::random_in_unit_disk() * (self.aperature / 2.0);
         let offset = self.u * rd.x() + self.v * rd.y();
         Ray::new(
-            self.origin + offset, 
-            self.lower_left_corner + self.horizontal*s + self.vertical*t - self.origin - offset,
+            self.origin + offset,
+            self.lower_left_corner + self.horizontal * s + self.vertical * t - self.origin - offset,
             random_range(self.time0, self.time1),
         )
     }
 }
-

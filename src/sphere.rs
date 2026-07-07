@@ -1,16 +1,14 @@
-
-use crate::vec3::Vec3;
-use crate::vec2::Vec2;
-use crate::hit::Hittable;
-use crate::hit::HitRecord;
-use crate::ray::Ray;
-use crate::material::Material;
 use crate::aabb::Aabb;
-use std::sync::Arc;
+use crate::hit::HitRecord;
+use crate::material::Material;
+use crate::ray::Ray;
+use crate::vec2::Vec2;
+use crate::vec3::Vec3;
 use std::f64::consts::PI;
-
+use std::sync::Arc;
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Sphere {
     pub center0: Vec3,
     pub center1: Vec3,
@@ -22,7 +20,14 @@ pub struct Sphere {
 }
 
 impl Sphere {
-    pub fn new(center0: Vec3, center1: Vec3, time0: f64, time1: f64, radius: f64, material: Arc<Material>) -> Sphere {
+    pub fn new(
+        center0: Vec3,
+        center1: Vec3,
+        time0: f64,
+        time1: f64,
+        radius: f64,
+        material: Arc<Material>,
+    ) -> Sphere {
         let area = 4.0 * PI * radius.powf(2.0);
         Sphere {
             center0,
@@ -36,7 +41,8 @@ impl Sphere {
     }
 
     pub fn center(&self, time: f64) -> Vec3 {
-        self.center0 + (self.center1 - self.center0) * ((time - self.time0) / (self.time1 - self.time0))
+        self.center0
+            + (self.center1 - self.center0) * ((time - self.time0) / (self.time1 - self.time0))
     }
 
     pub fn hit(&self, r: &Ray, t_min: f64, t_max: f64) -> (bool, Option<HitRecord>) {
@@ -56,32 +62,35 @@ impl Sphere {
                     let front_face = r.direction.dot(&normal) < 0.0;
 
                     let theta = f64::acos(-p.y);
-                    let phi = f64::atan2(-p.z, p.x) + PI;        
-                    let u = phi / (2.0*PI);
+                    let phi = f64::atan2(-p.z, p.x) + PI;
+                    let u = phi / (2.0 * PI);
                     let v = theta / PI;
-                    return (true,
+                    return (
+                        true,
                         Some(HitRecord {
-                        t: *root,
-                        point: p,
-                        normal: if front_face {normal} else {-normal},
-                        uv: Vec2::new(u as f32, v as f32),
-                        front_face,
-                        material: self.material.clone(), 
-                    }));
+                            t: *root,
+                            point: p,
+                            normal: if front_face { normal } else { -normal },
+                            uv: Vec2::new(u as f32, v as f32),
+                            front_face,
+                            material: self.material.clone(),
+                        }),
+                    );
                 }
             }
         }
-        (false, None)  
+        (false, None)
     }
 
     pub fn bounding_box(&self, time0: f64, time1: f64) -> Aabb {
         let box0 = Aabb::new(
             self.center(time0) - Vec3::new(self.radius, self.radius, self.radius),
-            self.center(time0) + Vec3::new(self.radius, self.radius, self.radius));
+            self.center(time0) + Vec3::new(self.radius, self.radius, self.radius),
+        );
         let box1 = Aabb::new(
             self.center(time1) - Vec3::new(self.radius, self.radius, self.radius),
-            self.center(time1) + Vec3::new(self.radius, self.radius, self.radius));
+            self.center(time1) + Vec3::new(self.radius, self.radius, self.radius),
+        );
         Aabb::surrounding_box(box0, box1)
     }
 }
-

@@ -1,9 +1,7 @@
 use crate::utility::{random_float, random_range};
 use std::f64;
-use std::{ops, cmp};
-use nalgebra::{Matrix3, Vector3};
 use std::f64::consts::PI;
-
+use std::ops;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Vec3 {
@@ -136,17 +134,19 @@ impl Vec3 {
     }
 
     pub fn refract(uv: &Vec3, n: &Vec3, etai_over_etat: f64) -> Vec3 {
-        let neg_uv = *uv*-1.0;
+        let neg_uv = *uv * -1.0;
         let cos_theta = f64::min(Vec3::dot(&neg_uv, n), 1.0);
-        let r_out_perp =  (*uv + *n * cos_theta) * etai_over_etat;
-        let r_out_parallel = *n * ((1.0 - r_out_perp.length_squared())).abs().sqrt() * -1.0;
+        let r_out_perp = (*uv + *n * cos_theta) * etai_over_etat;
+        let r_out_parallel = *n * (1.0 - r_out_perp.length_squared()).abs().sqrt() * -1.0;
         r_out_perp + r_out_parallel
     }
 
     pub fn random_in_unit_disk() -> Vec3 {
         loop {
-            let p = Vec3::new(random_range(-1.0,1.0), random_range(-1.0,1.0), 0.0);
-            if p.length_squared() >= 1.0 {continue;}
+            let p = Vec3::new(random_range(-1.0, 1.0), random_range(-1.0, 1.0), 0.0);
+            if p.length_squared() >= 1.0 {
+                continue;
+            }
             return p;
         }
     }
@@ -184,7 +184,6 @@ impl Vec3 {
         direction
     }
 
-    
     pub fn random_cosine_direction() -> Vec3 {
         let r1 = random_float();
         let r2 = random_float();
@@ -227,8 +226,8 @@ impl ops::Add<Vec<f64>> for Vec3 {
             other[0] + self.x,
             other[1] + self.y,
             other[2] + self.z,
-            other[3]
-        ] 
+            other[3],
+        ]
     }
 }
 
@@ -272,7 +271,7 @@ impl ops::Mul<Vec<f64>> for Vec3 {
             other[0] * self.x,
             other[1] * self.y,
             other[2] * self.z,
-            other[3]
+            other[3],
         ]
     }
 }

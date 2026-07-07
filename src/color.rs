@@ -1,6 +1,5 @@
-use std::cmp::Ordering;
-use crate::vec3::Vec3;
 use crate::mat3::Mat3;
+use crate::vec3::Vec3;
 
 #[derive(Debug, Clone, Copy)]
 pub struct Color {
@@ -23,10 +22,12 @@ impl Color {
         Self::new(1.0, 1.0, 1.0, 1.0)
     }
 
+    #[allow(dead_code)]
     pub fn gray() -> Self {
         Self::new(0.5, 0.5, 0.5, 1.0)
     }
 
+    #[allow(dead_code)]
     pub fn green() -> Self {
         Self::new(0.0, 1.0, 0.0, 1.0)
     }
@@ -36,18 +37,18 @@ impl Color {
     }
 
     pub fn max(&self) -> f64 {
-        if self.r > self.g && self.r > self.b{
-            return self.r
+        if self.r > self.g && self.r > self.b {
+            return self.r;
         } else if self.g > self.r && self.g > self.b {
-            return self.g
+            return self.g;
         } else {
-            return self.b
+            return self.b;
         }
     }
 
     pub fn has_nan(&self) -> bool {
         if self.r.is_nan() || self.g.is_nan() || self.b.is_nan() || self.a.is_nan() {
-            return true
+            return true;
         }
         false
     }
@@ -64,13 +65,13 @@ impl Color {
         let tangent_matrix = Mat3::new([
             [tangent.x, bitangent.x, surface_normal.x],
             [tangent.y, bitangent.y, surface_normal.y],
-            [tangent.z, bitangent.z, surface_normal.z]
-            ]);
+            [tangent.z, bitangent.z, surface_normal.z],
+        ]);
 
         // transform to world space
         let world_normal = tangent_matrix * tangent_normal;
 
-        return world_normal
+        return world_normal;
     }
 }
 
@@ -121,7 +122,7 @@ impl std::ops::Mul<f64> for Color {
             r: self.r * t,
             g: self.g * t,
             b: self.b * t,
-            a: self.a
+            a: self.a,
         }
     }
 }
@@ -147,7 +148,7 @@ impl std::ops::Div<f64> for Color {
             r: self.r / rhs,
             g: self.g / rhs,
             b: self.b / rhs,
-            a: self.a
+            a: self.a,
         }
     }
 }
@@ -173,7 +174,7 @@ impl std::ops::Div<Color> for Color {
             r: self.r / other.r,
             g: self.g / other.g,
             b: self.b / other.b,
-            a: self.a / other.a
+            a: self.a / other.a,
         }
     }
 }
