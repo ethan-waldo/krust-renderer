@@ -8,6 +8,7 @@ use crate::hit::{HittableList, Object};
 use crate::lights::{DirectionalLight, QuadLight};
 use crate::material::{Material, Principle};
 use crate::path_recording;
+use crate::relighting::{self, VirtualLight};
 use crate::render::{get_pixel_chunks, render_chunk};
 use crate::sphere::Sphere;
 use crate::texture::TextureMap;
@@ -567,13 +568,13 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
         }
     }
 
+    let path_output = setting_string(&data["settings"], "path_output_file")
+        .unwrap_or_else(|| output_path(output_dir, "krust_paths.jsonl"));
     if setting_bool(&data["settings"], "record_paths", false) {
         let path_spp = setting_u16(&data["settings"], "path_spp", 1).max(1);
         let path_depth = setting_u32(&data["settings"], "path_depth", depth).max(1);
-        let path_output = setting_string(&data["settings"], "path_output_file")
-            .unwrap_or_else(|| output_path(output_dir, "krust_paths.jsonl"));
         if let Err(err) = path_recording::record_scene_paths(
-            path_output,
+            &path_output,
             width,
             height,
             path_spp,
@@ -582,6 +583,27 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             world_bvh.clone(),
         ) {
             eprintln!("Failed to record light-agnostic paths: {err}");
+        }
+    }
+
+    if setting_bool(&data["settings"], "gather_relighting", false) {
+        let relight_path = setting_string(&data["settings"], "relight_path_file")
+            .unwrap_or_else(|| path_output.clone());
+        let relight_output = setting_string(&data["settings"], "relight_output_file")
+            .unwrap_or_else(|| output_path(output_dir, "krust_relight.exr"));
+        let mut virtual_lights = relighting::virtual_lights_from_json(&data["settings"]);
+        if virtual_lights.is_empty() {
+            virtual_lights = scene_quad_lights_as_virtual_lights(&quad_lights);
+        }
+
+        if let Err(err) = relighting::gather_light_from_paths(
+            relight_path,
+            relight_output,
+            width,
+            height,
+            &virtual_lights,
+        ) {
+            eprintln!("Failed to gather relighting pass: {err}");
         }
     }
 }
@@ -716,4 +738,18 @@ fn write_kpcn_metadata(
     );
 
     fs::write(path, metadata)
+}
+
+fn scene_quad_lights_as_virtual_lights(lights: &Arc<Vec<Object>>) -> Vec<VirtualLight> {
+    lights
+        .iter()
+        .filter_map(|light| match light {
+            Object::QuadLight(quad_light) => Some(VirtualLight::new(
+                quad_light.position,
+                quad_light.color,
+                quad_light.intensity,
+            )),
+            _ => None,
+        })
+        .collect()
 }
