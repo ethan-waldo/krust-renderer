@@ -45,6 +45,20 @@ impl Material {
             },
         }
     }
+
+    pub fn scatter_indirect(
+        &self,
+        ray: &Ray,
+        hit_rec: &HitRecord,
+    ) -> Option<(Ray, Color, Color, String)> {
+        match self {
+            Material::Principle(principle) => {
+                let lights = Arc::new(Vec::new());
+                principle.scatter_with_direct_lighting(ray, hit_rec, &lights, false)
+            }
+            Material::Light(light) => light.scatter(ray, hit_rec, &Arc::new(Vec::new())),
+        }
+    }
 }
 
 impl Scatterable for Material {
@@ -224,6 +238,18 @@ impl Scatterable for Principle {
         rec: &HitRecord,
         lights: &Arc<Vec<Object>>,
     ) -> Option<(Ray, Color, Color, String)> {
+        self.scatter_with_direct_lighting(r_in, rec, lights, true)
+    }
+}
+
+impl Principle {
+    fn scatter_with_direct_lighting(
+        &self,
+        r_in: &Ray,
+        rec: &HitRecord,
+        lights: &Arc<Vec<Object>>,
+        sample_direct_lighting: bool,
+    ) -> Option<(Ray, Color, Color, String)> {
         // sample textures if available
         let mut diffuse = self.diffuse;
         if self.diffuse_texture.is_some() {
@@ -347,28 +373,32 @@ impl Scatterable for Principle {
         // light pdf
         let mut to_light = Vec3::zeros();
         let mut sum_pdf = 0.0;
-        for light in lights.iter() {
-            match light {
-                Object::QuadLight(quad_light) => {
-                    let distance_squared = (quad_light.position - rec.point).length_squared();
-                    sum_pdf += quad_light.area / distance_squared;
+        if sample_direct_lighting {
+            for light in lights.iter() {
+                match light {
+                    Object::QuadLight(quad_light) => {
+                        let distance_squared = (quad_light.position - rec.point).length_squared();
+                        sum_pdf += quad_light.area / distance_squared;
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
         // pick a light
         let mut chosen_light = None;
-        for light in lights.iter() {
-            match light {
-                Object::QuadLight(quad_light) => {
-                    let distance_squared = (quad_light.position - rec.point).length_squared();
-                    let pdf = quad_light.area / distance_squared;
-                    if chosen_light.is_none() && random_float() < pdf / sum_pdf {
-                        chosen_light = Some(quad_light);
+        if sample_direct_lighting && sum_pdf > 0.0 {
+            for light in lights.iter() {
+                match light {
+                    Object::QuadLight(quad_light) => {
+                        let distance_squared = (quad_light.position - rec.point).length_squared();
+                        let pdf = quad_light.area / distance_squared;
+                        if chosen_light.is_none() && random_float() < pdf / sum_pdf {
+                            chosen_light = Some(quad_light);
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
             }
         }
 
@@ -444,7 +474,7 @@ impl Scatterable for Principle {
             }
 
             // determine direction of reflected ray
-            let direct = random_float() < 0.5;
+            let direct = sample_direct_lighting && chosen_light.is_some() && random_float() < 0.5;
             let (l, h) = if direct {
                 // sample a light
                 let l = to_light;
@@ -474,10 +504,17 @@ impl Scatterable for Principle {
             let ggx = f * g * d / f64::max(4.0 * ndv * ndl, 0.015);
 
             // compute weights
-            let light_pdf = LightPdf::new(lights.clone(), rec.point, rec.normal);
-            let direct_weight = light_pdf.value(&scattered.direction);
+            let direct_weight = if sample_direct_lighting {
+                LightPdf::new(lights.clone(), rec.point, rec.normal).value(&scattered.direction)
+            } else {
+                0.0
+            };
             let indirect_weight = d * ndh / (4.0 * ldh);
-            let weight = direct_weight * 0.5 + indirect_weight * 0.5;
+            let weight = if sample_direct_lighting {
+                direct_weight * 0.5 + indirect_weight * 0.5
+            } else {
+                indirect_weight
+            };
 
             // final color composite
             let attenuation = if metal {
@@ -493,15 +530,24 @@ impl Scatterable for Principle {
             let mut scattered = Ray::new(rec.point, cosine_pdf.generate(), r_in.time);
 
             // directly sample lights half the time
-            let direct = random_float() > 0.5;
+            let direct = sample_direct_lighting && chosen_light.is_some() && random_float() > 0.5;
             if direct {
                 scattered.direction = to_light;
             }
 
             // compute weights
-            let light_pdf = LightPdf::new(lights.clone(), rec.point, perturbed_normal);
-            let cosine_pdf_val = cosine_pdf.value(&scattered.direction) * 0.5;
-            let light_pdf_val = light_pdf.value(&scattered.direction) * 0.5;
+            let cosine_pdf_val = if sample_direct_lighting {
+                cosine_pdf.value(&scattered.direction) * 0.5
+            } else {
+                cosine_pdf.value(&scattered.direction)
+            };
+            let light_pdf_val = if sample_direct_lighting {
+                LightPdf::new(lights.clone(), rec.point, perturbed_normal)
+                    .value(&scattered.direction)
+                    * 0.5
+            } else {
+                0.0
+            };
             let mut pdf = Principle::scatter_pdf(&r_in, &rec, &scattered);
             pdf = pdf / (cosine_pdf_val + light_pdf_val);
 

@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 rand = "0.8.3"
 image = "0.24.5"
+exr = "1.5.2"
 indicatif = "0.17.1"
 serde_json = "1.0"
 show-image = "0.13.1"

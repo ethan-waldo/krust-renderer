@@ -3,9 +3,11 @@ use crate::buffers::{FrameBuffers, Lobes};
 use crate::bvh::Bvh;
 use crate::camera::Camera;
 use crate::color::Color;
+use crate::exr_export;
 use crate::hit::{HittableList, Object};
 use crate::lights::{DirectionalLight, QuadLight};
 use crate::material::{Material, Principle};
+use crate::path_recording;
 use crate::render::{get_pixel_chunks, render_chunk};
 use crate::sphere::Sphere;
 use crate::texture::TextureMap;
@@ -17,6 +19,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use show_image::{create_window, ImageInfo, ImageView, WindowOptions};
 use std::collections::HashMap;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::{fs, thread};
 
@@ -66,30 +69,30 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     ));
     let spp: u16 = data["settings"]["spp"].as_u64().unwrap() as u16;
     let depth: u32 = data["settings"]["depth"].as_u64().unwrap() as u32;
+    let preview_window = setting_bool(&data["settings"], "preview_window", true);
 
-    // create framebuffers and viewer
-    let mut preview: RgbaImage = ImageBuffer::new(width, height);
-    let mut preview_diff: RgbaImage = ImageBuffer::new(width, height);
-    let buffer_rgba: Rgba32FImage = ImageBuffer::new(width, height);
-    let buffer_diffuse: Rgba32FImage = ImageBuffer::new(width, height);
-    let buffer_specular: Rgba32FImage = ImageBuffer::new(width, height);
-    let mut buffers = FrameBuffers::new(buffer_rgba, buffer_diffuse, buffer_specular);
-    let render_view = ImageView::new(ImageInfo::rgb8(width, height), &preview);
-    let window = create_window(
-        "Krrust",
-        WindowOptions::new()
-            .set_size([width, height])
-            .set_preserve_aspect_ratio(true)
-            .set_borderless(false)
-            .set_show_overlays(true),
-    );
-    let _ = window
-        .as_ref()
-        .expect("REASON")
-        .set_image("image-001", render_view);
-    let mut output = data["settings"]["output_file"].to_string();
-    output.pop();
-    output.remove(0);
+    // create viewer
+    let preview: RgbaImage = ImageBuffer::new(width, height);
+    let window = if preview_window {
+        let render_view = ImageView::new(ImageInfo::rgb8(width, height), &preview);
+        let window = create_window(
+            "Krrust",
+            WindowOptions::new()
+                .set_size([width, height])
+                .set_preserve_aspect_ratio(true)
+                .set_borderless(false)
+                .set_show_overlays(true),
+        );
+        let _ = window
+            .as_ref()
+            .expect("REASON")
+            .set_image("image-001", render_view);
+        Some(window)
+    } else {
+        None
+    };
+    let output = setting_string(&data["settings"], "output_file")
+        .unwrap_or_else(|| output_path(output_dir, "krust_render.exr"));
     let output_file = output_dir.to_owned() + "krust_render.png";
 
     // init world
@@ -426,11 +429,6 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     //----------------------------------------------------------------------------------
     println!("Rendering scene...");
 
-    let progress = ProgressBar::new((spp - 1) as u64).with_message("%...");
-    progress.set_style(
-        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.gray} {percent}{msg}").unwrap(),
-    );
-
     let pixel_chunks = Arc::new(get_pixel_chunks(
         64 as usize,
         width as usize,
@@ -438,85 +436,284 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     ));
     let num_threads = num_cpus::get();
     let thread_chunk_size = (pixel_chunks.len() as f32 / num_threads as f32).ceil() as usize;
-    for sample in 0..spp {
-        if sample != 0 {
-            progress.inc(1);
-        }
-        let skydome_texture = Arc::new(TextureMap::new(
-            "g:/rust_projects/krrust/textures/alley_01.jpg",
-            true,
-        ));
-        let mut handles = Vec::with_capacity(num_threads);
-        for chunk in pixel_chunks.chunks(thread_chunk_size).map(|c| c.to_vec()) {
-            let camera = camera.clone();
-            let world_bvh = world_bvh.clone();
-            let quad_lights = quad_lights.clone();
-            let dir_lights = dir_lights.clone();
-            let _sky = skydome_texture.clone();
-            let handle = thread::spawn(move || {
-                let result = chunk
-                    .iter()
-                    .map(|c| {
-                        render_chunk(
-                            c,
-                            height,
-                            width,
-                            &sample,
-                            &camera,
-                            &world_bvh,
-                            &quad_lights,
-                            &dir_lights,
-                            depth,
-                            depth,
-                            progressive,
-                            &None, //&Some(sky.clone()),
-                            false,
-                        )
-                    })
-                    .collect::<Vec<Vec<(u32, u32, Lobes)>>>();
-                result
-            });
-            handles.push(handle);
-        }
+    let render_pass = |pass_spp: u16, preview_output: &str, label: &str| -> FrameBuffers {
+        let pass_spp = pass_spp.max(1);
+        let mut preview: RgbaImage = ImageBuffer::new(width, height);
+        let buffer_rgba: Rgba32FImage = ImageBuffer::new(width, height);
+        let buffer_diffuse: Rgba32FImage = ImageBuffer::new(width, height);
+        let buffer_specular: Rgba32FImage = ImageBuffer::new(width, height);
+        let mut buffers = FrameBuffers::new(buffer_rgba, buffer_diffuse, buffer_specular);
 
-        for handle in handles {
-            let thread_result = handle.join().unwrap();
-            for chunk_result in thread_result.iter() {
-                for pixel in chunk_result {
-                    let (x, y, color) = (pixel.0, pixel.1, pixel.2);
-                    let color = buffers.accumulate_pixel(x, y, sample, color);
-                    let rgba = color.rgba;
-                    let diff = color.diffuse;
-                    preview.put_pixel(
-                        x,
-                        y,
-                        Rgba([
-                            (rgba.r.sqrt() * 255.999) as u8,
-                            (rgba.g.sqrt() * 255.999) as u8,
-                            (rgba.b.sqrt() * 255.999) as u8,
-                            255 as u8,
-                        ]),
-                    );
-                    preview_diff.put_pixel(
-                        x,
-                        y,
-                        Rgba([
-                            (diff.r.sqrt() * 255.999) as u8,
-                            (diff.g.sqrt() * 255.999) as u8,
-                            (diff.b.sqrt() * 255.999) as u8,
-                            (diff.a.sqrt() * 255.999) as u8,
-                        ]),
-                    );
+        let progress = ProgressBar::new((pass_spp - 1) as u64).with_message("%...");
+        progress.set_style(
+            ProgressStyle::with_template(&format!(
+                "{label} [{{elapsed_precise}}] {{bar:40.gray}} {{percent}}{{msg}}"
+            ))
+            .unwrap(),
+        );
+
+        for sample in 0..pass_spp {
+            if sample != 0 {
+                progress.inc(1);
+            }
+
+            let mut handles = Vec::with_capacity(num_threads);
+            for chunk in pixel_chunks.chunks(thread_chunk_size).map(|c| c.to_vec()) {
+                let camera = camera.clone();
+                let world_bvh = world_bvh.clone();
+                let quad_lights = quad_lights.clone();
+                let dir_lights = dir_lights.clone();
+                let handle = thread::spawn(move || {
+                    let result = chunk
+                        .iter()
+                        .map(|c| {
+                            render_chunk(
+                                c,
+                                height,
+                                width,
+                                &sample,
+                                &camera,
+                                &world_bvh,
+                                &quad_lights,
+                                &dir_lights,
+                                depth,
+                                depth,
+                                progressive,
+                                &None,
+                                false,
+                            )
+                        })
+                        .collect::<Vec<Vec<(u32, u32, Lobes)>>>();
+                    result
+                });
+                handles.push(handle);
+            }
+
+            for handle in handles {
+                let thread_result = handle.join().unwrap();
+                for chunk_result in thread_result.iter() {
+                    for pixel in chunk_result {
+                        let (x, y, color) = (pixel.0, pixel.1, pixel.2);
+                        let color = buffers.accumulate_pixel(x, y, sample, color);
+                        let rgba = color.rgba;
+                        preview.put_pixel(
+                            x,
+                            y,
+                            Rgba([
+                                (rgba.r.sqrt() * 255.999) as u8,
+                                (rgba.g.sqrt() * 255.999) as u8,
+                                (rgba.b.sqrt() * 255.999) as u8,
+                                255 as u8,
+                            ]),
+                        );
+                    }
                 }
             }
+            if let Some(window) = &window {
+                let render_view = ImageView::new(ImageInfo::rgba8(width, height), &preview);
+                let _ = window
+                    .as_ref()
+                    .expect("REASON")
+                    .set_image("image-001", render_view);
+            }
+            if !preview_output.is_empty() {
+                let _ = preview.save(preview_output);
+            }
         }
-        let render_view = ImageView::new(ImageInfo::rgba8(width, height), &preview);
-        let _ = window
-            .as_ref()
-            .expect("REASON")
-            .set_image("image-001", render_view);
-        let _ = preview.save(&output_file);
+
+        ProgressBar::finish_with_message(&progress, "% Render complete");
+        buffers
+    };
+
+    let dataset_settings = DatasetSettings::from_json(&data["settings"], spp, output_dir);
+    if dataset_settings.enabled {
+        let noisy_buffers = render_pass(dataset_settings.noisy_spp, &output_file, "KPCN noisy");
+        if let Err(err) =
+            exr_export::write_framebuffers(&dataset_settings.noisy_output, &noisy_buffers)
+        {
+            eprintln!("Failed to write noisy KPCN EXR: {err}");
+        }
+
+        if dataset_settings.reference_spp > 0 {
+            let reference_buffers = render_pass(
+                dataset_settings.reference_spp,
+                &output_file,
+                "KPCN reference",
+            );
+            if let Err(err) = exr_export::write_framebuffers(
+                &dataset_settings.reference_output,
+                &reference_buffers,
+            ) {
+                eprintln!("Failed to write reference KPCN EXR: {err}");
+            }
+        }
+
+        if let Err(err) = write_kpcn_metadata(
+            &dataset_settings.metadata_output,
+            width,
+            height,
+            dataset_settings.noisy_spp,
+            dataset_settings.reference_spp,
+            dataset_settings.crop_size,
+        ) {
+            eprintln!("Failed to write KPCN metadata: {err}");
+        }
+    } else {
+        let buffers = render_pass(spp, &output_file, "Render");
+        if should_export_exr(&data["settings"], &output) {
+            if let Err(err) = exr_export::write_framebuffers(&output, &buffers) {
+                eprintln!("Failed to write EXR: {err}");
+            }
+        }
     }
-    // buffers.rgba.save(&output);
-    ProgressBar::finish_with_message(&progress, "% Render complete")
+
+    if setting_bool(&data["settings"], "record_paths", false) {
+        let path_spp = setting_u16(&data["settings"], "path_spp", 1).max(1);
+        let path_depth = setting_u32(&data["settings"], "path_depth", depth).max(1);
+        let path_output = setting_string(&data["settings"], "path_output_file")
+            .unwrap_or_else(|| output_path(output_dir, "krust_paths.jsonl"));
+        if let Err(err) = path_recording::record_scene_paths(
+            path_output,
+            width,
+            height,
+            path_spp,
+            path_depth,
+            camera.clone(),
+            world_bvh.clone(),
+        ) {
+            eprintln!("Failed to record light-agnostic paths: {err}");
+        }
+    }
+}
+
+struct DatasetSettings {
+    enabled: bool,
+    noisy_spp: u16,
+    reference_spp: u16,
+    crop_size: u32,
+    noisy_output: String,
+    reference_output: String,
+    metadata_output: String,
+}
+
+impl DatasetSettings {
+    fn from_json(settings: &serde_json::Value, default_spp: u16, output_dir: &str) -> Self {
+        let mode = setting_string(settings, "dataset_mode").unwrap_or_default();
+        let enabled = mode == "kpcn" || setting_bool(settings, "kpcn_dataset", false);
+        let noisy_spp = setting_u16(settings, "noisy_spp", default_spp).max(1);
+        let reference_spp = setting_u16(settings, "reference_spp", 0);
+        let crop_size = setting_u32(settings, "crop_size", 64).max(1);
+
+        Self {
+            enabled,
+            noisy_spp,
+            reference_spp,
+            crop_size,
+            noisy_output: setting_string(settings, "noisy_output_file")
+                .unwrap_or_else(|| output_path(output_dir, "kpcn_noisy.exr")),
+            reference_output: setting_string(settings, "reference_output_file")
+                .unwrap_or_else(|| output_path(output_dir, "kpcn_reference.exr")),
+            metadata_output: setting_string(settings, "dataset_metadata_file")
+                .unwrap_or_else(|| output_path(output_dir, "kpcn_metadata.json")),
+        }
+    }
+}
+
+fn should_export_exr(settings: &serde_json::Value, output: &str) -> bool {
+    setting_bool(
+        settings,
+        "export_exr",
+        output.to_ascii_lowercase().ends_with(".exr"),
+    )
+}
+
+fn setting_string(settings: &serde_json::Value, key: &str) -> Option<String> {
+    settings[key].as_str().map(|value| value.to_string())
+}
+
+fn setting_bool(settings: &serde_json::Value, key: &str, default: bool) -> bool {
+    if let Some(value) = settings[key].as_bool() {
+        return value;
+    }
+
+    if let Some(value) = settings[key].as_u64() {
+        return value != 0;
+    }
+
+    if let Some(value) = settings[key].as_str() {
+        return value == "true" || value == "1";
+    }
+
+    default
+}
+
+fn setting_u16(settings: &serde_json::Value, key: &str, default: u16) -> u16 {
+    settings[key]
+        .as_u64()
+        .map(|value| value as u16)
+        .unwrap_or(default)
+}
+
+fn setting_u32(settings: &serde_json::Value, key: &str, default: u32) -> u32 {
+    settings[key]
+        .as_u64()
+        .map(|value| value as u32)
+        .unwrap_or(default)
+}
+
+fn output_path(output_dir: &str, file_name: &str) -> String {
+    PathBuf::from(output_dir)
+        .join(file_name)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn write_kpcn_metadata(
+    path: &str,
+    width: u32,
+    height: u32,
+    noisy_spp: u16,
+    reference_spp: u16,
+    crop_size: u32,
+) -> std::io::Result<()> {
+    if let Some(parent) = PathBuf::from(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let mut tiles = Vec::new();
+    let mut y = 0;
+    while y < height {
+        let mut x = 0;
+        while x < width {
+            let tile_width = (width - x).min(crop_size);
+            let tile_height = (height - y).min(crop_size);
+            tiles.push(format!(
+                "{{\"x\":{},\"y\":{},\"width\":{},\"height\":{}}}",
+                x, y, tile_width, tile_height
+            ));
+            x += crop_size;
+        }
+        y += crop_size;
+    }
+
+    let channels = exr_export::exported_channel_names()
+        .into_iter()
+        .map(|channel| format!("\"{channel}\""))
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let metadata = format!(
+        "{{\n  \"mode\":\"kpcn\",\n  \"width\":{},\n  \"height\":{},\n  \"noisy_spp\":{},\n  \"reference_spp\":{},\n  \"crop_size\":{},\n  \"channels\":[{}],\n  \"tiles\":[{}]\n}}\n",
+        width,
+        height,
+        noisy_spp,
+        reference_spp,
+        crop_size,
+        channels,
+        tiles.join(",")
+    );
+
+    fs::write(path, metadata)
 }
