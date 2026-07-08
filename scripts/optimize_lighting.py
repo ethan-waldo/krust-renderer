@@ -98,6 +98,7 @@ def main() -> None:
         if step % 25 == 0 or step == args.steps - 1:
             print(f"step {step}: loss={float(loss.detach()):.8f} rgb={prediction.detach().tolist()}")
 
+    output = Path(args.output)
     optimized = {
         "virtual_lights": [
             {
@@ -105,9 +106,12 @@ def main() -> None:
                 "color": [float(value) for value in raw_color.sigmoid().detach()],
                 "intensity": float(log_intensity.exp().detach()),
             }
-        ]
+        ],
+        "renderer_settings": {
+            "gather_relighting": 1,
+            "virtual_lights_file": str(output),
+        },
     }
-    output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(optimized, indent=2), encoding="utf-8")
 

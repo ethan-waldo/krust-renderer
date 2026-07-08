@@ -21,6 +21,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--paths", required=True, help="Path JSONL from record_paths")
     parser.add_argument("--output", required=True, help="Output .pt checkpoint")
     parser.add_argument("--virtual-lights", default="[]", help="JSON list of point lights")
+    parser.add_argument("--virtual-lights-file", help="JSON file containing {'virtual_lights': [...]}")
     parser.add_argument("--max-records", type=int, default=200_000)
     parser.add_argument("--epochs", type=int, default=5)
     parser.add_argument("--batch-size", type=int, default=4096)
@@ -43,6 +44,14 @@ def load_paths(path: Path, limit: int) -> list[dict]:
 
 def default_lights() -> list[dict]:
     return [{"position": [0.0, 3.0, 0.0], "color": [1.0, 1.0, 1.0], "intensity": 8.0}]
+
+
+def load_lights(args: argparse.Namespace) -> list[dict]:
+    lights = json.loads(args.virtual_lights)
+    if args.virtual_lights_file:
+        value = json.loads(Path(args.virtual_lights_file).read_text(encoding="utf-8"))
+        lights.extend(value.get("virtual_lights", []))
+    return lights or default_lights()
 
 
 def contribution(record: dict, light: dict) -> list[float]:
@@ -98,9 +107,7 @@ def main() -> None:
         raise SystemExit("PyTorch is required for training this external proxy script.") from exc
 
     records = load_paths(Path(args.paths), args.max_records)
-    lights = json.loads(args.virtual_lights)
-    if not lights:
-        lights = default_lights()
+    lights = load_lights(args)
 
     samples = [make_sample(record, light) for record in records for light in lights]
     random.shuffle(samples)

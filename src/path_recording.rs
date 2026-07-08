@@ -14,6 +14,7 @@ use std::thread;
 pub struct PathVertex {
     pub pixel_x: u32,
     pub pixel_y: u32,
+    pub sample: u16,
     pub depth: u32,
     pub position: Vec3,
     pub throughput: Color,
@@ -24,6 +25,7 @@ pub struct PathVertex {
 pub fn record_light_agnostic_path(
     pixel_x: u32,
     pixel_y: u32,
+    sample: u16,
     ray: &Ray,
     world: &Object,
     max_depth: u32,
@@ -48,6 +50,7 @@ pub fn record_light_agnostic_path(
             records.push(PathVertex {
                 pixel_x,
                 pixel_y,
+                sample,
                 depth,
                 position: hit_rec.point,
                 throughput,
@@ -65,6 +68,7 @@ pub fn record_light_agnostic_path(
                 records.push(PathVertex {
                     pixel_x,
                     pixel_y,
+                    sample,
                     depth,
                     position: hit_rec.point,
                     throughput,
@@ -83,6 +87,7 @@ pub fn record_light_agnostic_path(
                 records.push(PathVertex {
                     pixel_x,
                     pixel_y,
+                    sample,
                     depth,
                     position: hit_rec.point,
                     throughput,
@@ -124,11 +129,13 @@ pub fn record_scene_paths(
             let mut records = Vec::new();
             for y in row_start..row_end {
                 for x in 0..width {
-                    for _sample in 0..samples_per_pixel {
+                    for sample in 0..samples_per_pixel {
                         let u = (x as f64 + random_float()) / ((width - 1) as f64);
                         let v = 1.0 - ((y as f64 + random_float()) / ((height - 1) as f64));
                         let ray = camera.get_ray(u, v);
-                        records.extend(record_light_agnostic_path(x, y, &ray, &world, max_depth));
+                        records.extend(record_light_agnostic_path(
+                            x, y, sample, &ray, &world, max_depth,
+                        ));
                     }
                 }
             }
@@ -151,9 +158,10 @@ pub fn record_scene_paths(
 impl PathVertex {
     pub fn to_json_line(&self) -> String {
         format!(
-            "{{\"x\":{},\"y\":{},\"depth\":{},\"position\":[{:.8},{:.8},{:.8}],\"throughput\":[{:.8},{:.8},{:.8}],\"outgoing\":[{:.8},{:.8},{:.8}],\"terminated\":{}}}",
+            "{{\"x\":{},\"y\":{},\"sample\":{},\"depth\":{},\"position\":[{:.8},{:.8},{:.8}],\"throughput\":[{:.8},{:.8},{:.8}],\"outgoing\":[{:.8},{:.8},{:.8}],\"terminated\":{}}}",
             self.pixel_x,
             self.pixel_y,
+            self.sample,
             self.depth,
             self.position.x,
             self.position.y,
@@ -178,6 +186,7 @@ mod tests {
         let vertex = PathVertex {
             pixel_x: 3,
             pixel_y: 4,
+            sample: 1,
             depth: 2,
             position: Vec3::new(1.0, 2.0, 3.0),
             throughput: Color::new(0.5, 0.25, 0.125, 1.0),
@@ -189,6 +198,7 @@ mod tests {
 
         assert!(line.contains("\"x\":3"));
         assert!(line.contains("\"y\":4"));
+        assert!(line.contains("\"sample\":1"));
         assert!(line.contains("\"depth\":2"));
         assert!(line.contains("\"terminated\":true"));
     }

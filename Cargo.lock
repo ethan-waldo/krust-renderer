@@ -921,6 +921,7 @@ dependencies = [
 name = "krrust"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
  "cgmath",
  "exr",
  "image",
@@ -932,6 +933,7 @@ dependencies = [
  "rayon",
  "serde_json",
  "show-image",
+ "wgpu",
 ]
 
 [[package]]

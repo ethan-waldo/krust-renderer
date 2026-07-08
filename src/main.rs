@@ -4,6 +4,7 @@ mod bvh;
 mod camera;
 mod color;
 mod exr_export;
+mod gpu;
 mod hit;
 mod lights;
 mod mat3;

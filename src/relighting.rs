@@ -4,6 +4,7 @@ use crate::exr_export;
 use crate::vec3::Vec3;
 use image::{ImageBuffer, Rgba32FImage};
 use serde_json::Value;
+use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::path::Path;
@@ -38,12 +39,15 @@ pub fn gather_light_from_paths(
     output_file: impl AsRef<Path>,
     width: u32,
     height: u32,
+    samples_per_pixel: u16,
     lights: &[VirtualLight],
 ) -> Result<(), Box<dyn Error>> {
     let rgba: Rgba32FImage = ImageBuffer::new(width, height);
     let diffuse: Rgba32FImage = ImageBuffer::new(width, height);
     let specular: Rgba32FImage = ImageBuffer::new(width, height);
     let mut buffers = FrameBuffers::new(rgba, diffuse, specular);
+    let mut sample_contributions: HashMap<(u32, u32, u16), Color> = HashMap::new();
+    let mut inferred_sample_count = 0;
 
     let data = fs::read_to_string(path_file)?;
     for line in data.lines().filter(|line| !line.trim().is_empty()) {
@@ -57,6 +61,8 @@ pub fn gather_light_from_paths(
         if x >= width || y >= height {
             continue;
         }
+        let sample = record["sample"].as_u64().unwrap_or(0) as u16;
+        inferred_sample_count = inferred_sample_count.max(sample as u32 + 1);
 
         let Some(position) = json_vec3(&record["position"]) else {
             continue;
@@ -73,13 +79,23 @@ pub fn gather_light_from_paths(
                 contribution + throughput * light.color * (light.intensity / distance_squared);
         }
 
+        let entry = sample_contributions
+            .entry((x, y, sample))
+            .or_insert_with(Color::black);
+        *entry = *entry + contribution;
+    }
+
+    let mut pixel_sums: HashMap<(u32, u32), Color> = HashMap::new();
+    for ((x, y, _sample), contribution) in sample_contributions {
+        let entry = pixel_sums.entry((x, y)).or_insert_with(Color::black);
+        *entry = *entry + contribution;
+    }
+
+    let sample_count = (samples_per_pixel as u32).max(inferred_sample_count).max(1);
+    for ((x, y), sum) in pixel_sums {
+        let averaged = sum / sample_count;
         let mut current = buffers.get_pixel(x, y);
-        current.rgba = Color::new(
-            current.rgba.r + contribution.r,
-            current.rgba.g + contribution.g,
-            current.rgba.b + contribution.b,
-            1.0,
-        );
+        current.rgba = Color::new(averaged.r, averaged.g, averaged.b, 1.0);
         buffers.put_pixel(x, y, current);
     }
 
@@ -87,10 +103,26 @@ pub fn gather_light_from_paths(
 }
 
 pub fn virtual_lights_from_json(settings: &Value) -> Vec<VirtualLight> {
-    settings["virtual_lights"]
+    let mut lights: Vec<VirtualLight> = settings["virtual_lights"]
         .as_array()
         .map(|lights| lights.iter().filter_map(VirtualLight::from_json).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if let Some(file) = settings["virtual_lights_file"].as_str() {
+        if let Ok(data) = fs::read_to_string(file) {
+            if let Ok(value) = serde_json::from_str::<Value>(&data) {
+                lights.extend(
+                    value["virtual_lights"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(VirtualLight::from_json),
+                );
+            }
+        }
+    }
+
+    lights
 }
 
 fn json_vec3(value: &Value) -> Option<Vec3> {
@@ -130,10 +162,44 @@ mod tests {
             &output_file,
             1,
             1,
+            1,
             &[VirtualLight::new(
                 Vec3::new(0.0, 1.0, 0.0),
                 Color::new(1.0, 0.5, 0.25, 1.0),
                 2.0,
+            )],
+        )
+        .unwrap();
+
+        assert!(fs::metadata(&output_file).unwrap().len() > 0);
+        let _ = fs::remove_file(path_file);
+        let _ = fs::remove_file(output_file);
+    }
+
+    #[test]
+    fn averages_multiple_path_samples_per_pixel() {
+        let dir = std::env::temp_dir();
+        let path_file = dir.join("krust_relight_average_paths.jsonl");
+        let output_file = dir.join("krust_relight_average.exr");
+        fs::write(
+            &path_file,
+            concat!(
+                "{\"x\":0,\"y\":0,\"sample\":0,\"depth\":0,\"position\":[0.0,0.0,0.0],\"throughput\":[1.0,1.0,1.0],\"outgoing\":[0.0,1.0,0.0],\"terminated\":false}\n",
+                "{\"x\":0,\"y\":0,\"sample\":1,\"depth\":0,\"position\":[0.0,0.0,0.0],\"throughput\":[0.5,0.5,0.5],\"outgoing\":[0.0,1.0,0.0],\"terminated\":false}\n",
+            ),
+        )
+        .unwrap();
+
+        gather_light_from_paths(
+            &path_file,
+            &output_file,
+            1,
+            1,
+            2,
+            &[VirtualLight::new(
+                Vec3::new(0.0, 1.0, 0.0),
+                Color::white(),
+                1.0,
             )],
         )
         .unwrap();

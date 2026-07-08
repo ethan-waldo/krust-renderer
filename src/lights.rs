@@ -118,6 +118,22 @@ impl DirectionalLight {
         }
     }
 
+    pub fn direction(&self) -> Vec3 {
+        self.direction
+    }
+
+    pub fn color(&self) -> Color {
+        self.color
+    }
+
+    pub fn intensity(&self) -> f64 {
+        self.intensity
+    }
+
+    pub fn softness(&self) -> f64 {
+        self.softness
+    }
+
     pub fn irradiance(&self, normal: Vec3, view_dir: Vec3, roughness: f64, lobe: &str) -> Color {
         let cos_theta = (-self.direction).dot(&normal).max(0.0);
         let diffuse = self.color * self.intensity * cos_theta;

@@ -71,4 +71,13 @@ impl Camera {
             random_range(self.time0, self.time1),
         )
     }
+
+    pub fn raster_basis(&self) -> (Vec3, Vec3, Vec3, Vec3) {
+        (
+            self.origin,
+            self.lower_left_corner,
+            self.horizontal,
+            self.vertical,
+        )
+    }
 }

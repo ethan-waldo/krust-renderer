@@ -4,6 +4,7 @@ use crate::bvh::Bvh;
 use crate::camera::Camera;
 use crate::color::Color;
 use crate::exr_export;
+use crate::gpu;
 use crate::hit::{HittableList, Object};
 use crate::lights::{DirectionalLight, QuadLight};
 use crate::material::{Material, Principle};
@@ -95,6 +96,9 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     let output = setting_string(&data["settings"], "output_file")
         .unwrap_or_else(|| output_path(output_dir, "krust_render.exr"));
     let output_file = output_dir.to_owned() + "krust_render.png";
+    let render_backend = setting_string(&data["settings"], "render_backend")
+        .unwrap_or_else(|| "cpu".to_string())
+        .to_ascii_lowercase();
 
     // init world
     let mut world = HittableList::new();
@@ -445,6 +449,59 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
         let buffer_specular: Rgba32FImage = ImageBuffer::new(width, height);
         let mut buffers = FrameBuffers::new(buffer_rgba, buffer_diffuse, buffer_specular);
 
+        if render_backend == "gpu" || render_backend == "gpu_aov" || render_backend == "webgpu" {
+            let unsupported_gpu_features =
+                gpu::scene_support_report(&world.objects, dir_lights.len());
+            if !unsupported_gpu_features.is_empty() {
+                panic!(
+                    "GPU render backend does not yet support this scene with full parity: {}",
+                    unsupported_gpu_features.join(", ")
+                );
+            } else {
+                let gpu_result = if render_backend == "gpu_aov" {
+                    gpu::render_first_hit_aovs(
+                        width,
+                        height,
+                        camera.as_ref(),
+                        &world.objects,
+                        dir_lights.as_ref(),
+                    )
+                } else {
+                    gpu::render_path_trace(
+                        width,
+                        height,
+                        pass_spp,
+                        depth,
+                        camera.as_ref(),
+                        &world.objects,
+                        dir_lights.as_ref(),
+                    )
+                };
+
+                match gpu_result {
+                    Ok(gpu_buffers) => {
+                        buffers = gpu_buffers;
+                        write_preview_from_buffers(&buffers, &mut preview);
+                        if let Some(window) = &window {
+                            let render_view =
+                                ImageView::new(ImageInfo::rgba8(width, height), &preview);
+                            let _ = window
+                                .as_ref()
+                                .expect("REASON")
+                                .set_image("image-001", render_view);
+                        }
+                        if !preview_output.is_empty() {
+                            let _ = preview.save(preview_output);
+                        }
+                        return buffers;
+                    }
+                    Err(err) => {
+                        panic!("GPU render backend failed: {err}");
+                    }
+                }
+            }
+        }
+
         let progress = ProgressBar::new((pass_spp - 1) as u64).with_message("%...");
         progress.set_style(
             ProgressStyle::with_template(&format!(
@@ -526,44 +583,46 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
         buffers
     };
 
-    let dataset_settings = DatasetSettings::from_json(&data["settings"], spp, output_dir);
-    if dataset_settings.enabled {
-        let noisy_buffers = render_pass(dataset_settings.noisy_spp, &output_file, "KPCN noisy");
-        if let Err(err) =
-            exr_export::write_framebuffers(&dataset_settings.noisy_output, &noisy_buffers)
-        {
-            eprintln!("Failed to write noisy KPCN EXR: {err}");
-        }
-
-        if dataset_settings.reference_spp > 0 {
-            let reference_buffers = render_pass(
-                dataset_settings.reference_spp,
-                &output_file,
-                "KPCN reference",
-            );
-            if let Err(err) = exr_export::write_framebuffers(
-                &dataset_settings.reference_output,
-                &reference_buffers,
-            ) {
-                eprintln!("Failed to write reference KPCN EXR: {err}");
+    if !setting_bool(&data["settings"], "relight_only", false) {
+        let dataset_settings = DatasetSettings::from_json(&data["settings"], spp, output_dir);
+        if dataset_settings.enabled {
+            let noisy_buffers = render_pass(dataset_settings.noisy_spp, &output_file, "KPCN noisy");
+            if let Err(err) =
+                exr_export::write_framebuffers(&dataset_settings.noisy_output, &noisy_buffers)
+            {
+                eprintln!("Failed to write noisy KPCN EXR: {err}");
             }
-        }
 
-        if let Err(err) = write_kpcn_metadata(
-            &dataset_settings.metadata_output,
-            width,
-            height,
-            dataset_settings.noisy_spp,
-            dataset_settings.reference_spp,
-            dataset_settings.crop_size,
-        ) {
-            eprintln!("Failed to write KPCN metadata: {err}");
-        }
-    } else {
-        let buffers = render_pass(spp, &output_file, "Render");
-        if should_export_exr(&data["settings"], &output) {
-            if let Err(err) = exr_export::write_framebuffers(&output, &buffers) {
-                eprintln!("Failed to write EXR: {err}");
+            if dataset_settings.reference_spp > 0 {
+                let reference_buffers = render_pass(
+                    dataset_settings.reference_spp,
+                    &output_file,
+                    "KPCN reference",
+                );
+                if let Err(err) = exr_export::write_framebuffers(
+                    &dataset_settings.reference_output,
+                    &reference_buffers,
+                ) {
+                    eprintln!("Failed to write reference KPCN EXR: {err}");
+                }
+            }
+
+            if let Err(err) = write_kpcn_metadata(
+                &dataset_settings.metadata_output,
+                width,
+                height,
+                dataset_settings.noisy_spp,
+                dataset_settings.reference_spp,
+                dataset_settings.crop_size,
+            ) {
+                eprintln!("Failed to write KPCN metadata: {err}");
+            }
+        } else {
+            let buffers = render_pass(spp, &output_file, "Render");
+            if should_export_exr(&data["settings"], &output) {
+                if let Err(err) = exr_export::write_framebuffers(&output, &buffers) {
+                    eprintln!("Failed to write EXR: {err}");
+                }
             }
         }
     }
@@ -573,37 +632,85 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     if setting_bool(&data["settings"], "record_paths", false) {
         let path_spp = setting_u16(&data["settings"], "path_spp", 1).max(1);
         let path_depth = setting_u32(&data["settings"], "path_depth", depth).max(1);
-        if let Err(err) = path_recording::record_scene_paths(
-            &path_output,
-            width,
-            height,
-            path_spp,
-            path_depth,
-            camera.clone(),
-            world_bvh.clone(),
-        ) {
-            eprintln!("Failed to record light-agnostic paths: {err}");
+        let gpu_record_paths =
+            render_backend == "gpu" || render_backend == "gpu_aov" || render_backend == "webgpu";
+        let gpu_recorded = if gpu_record_paths {
+            match gpu::record_scene_paths(
+                &path_output,
+                width,
+                height,
+                path_spp,
+                path_depth,
+                camera.as_ref(),
+                &world.objects,
+                dir_lights.as_ref(),
+            ) {
+                Ok(count) => {
+                    eprintln!("Recorded {count} light-agnostic GPU path vertices.");
+                    true
+                }
+                Err(err) => {
+                    panic!("GPU path recording failed: {err}");
+                }
+            }
+        } else {
+            false
+        };
+
+        if !gpu_recorded {
+            if let Err(err) = path_recording::record_scene_paths(
+                &path_output,
+                width,
+                height,
+                path_spp,
+                path_depth,
+                camera.clone(),
+                world_bvh.clone(),
+            ) {
+                eprintln!("Failed to record light-agnostic paths: {err}");
+            }
         }
     }
 
     if setting_bool(&data["settings"], "gather_relighting", false) {
+        let relight_spp = setting_u16(
+            &data["settings"],
+            "relight_path_spp",
+            setting_u16(&data["settings"], "path_spp", 1),
+        )
+        .max(1);
         let relight_path = setting_string(&data["settings"], "relight_path_file")
             .unwrap_or_else(|| path_output.clone());
         let relight_output = setting_string(&data["settings"], "relight_output_file")
             .unwrap_or_else(|| output_path(output_dir, "krust_relight.exr"));
+        let relight_metadata = setting_string(&data["settings"], "relight_metadata_file")
+            .unwrap_or_else(|| output_path(output_dir, "krust_relight.json"));
         let mut virtual_lights = relighting::virtual_lights_from_json(&data["settings"]);
         if virtual_lights.is_empty() {
             virtual_lights = scene_quad_lights_as_virtual_lights(&quad_lights);
         }
 
         if let Err(err) = relighting::gather_light_from_paths(
-            relight_path,
-            relight_output,
+            &relight_path,
+            &relight_output,
             width,
             height,
+            relight_spp,
             &virtual_lights,
         ) {
             eprintln!("Failed to gather relighting pass: {err}");
+        }
+
+        if let Err(err) = write_relighting_metadata(
+            &relight_metadata,
+            width,
+            height,
+            relight_spp,
+            &relight_path,
+            &relight_output,
+            &virtual_lights,
+        ) {
+            eprintln!("Failed to write relighting metadata: {err}");
         }
     }
 }
@@ -690,6 +797,33 @@ fn output_path(output_dir: &str, file_name: &str) -> String {
         .to_string()
 }
 
+fn write_preview_from_buffers(buffers: &FrameBuffers, preview: &mut RgbaImage) {
+    let (width, height) = buffers.rgba.dimensions();
+    for y in 0..height {
+        for x in 0..width {
+            let rgba = buffers.get_pixel(x, y).rgba;
+            preview.put_pixel(
+                x,
+                y,
+                Rgba([
+                    preview_channel(rgba.r),
+                    preview_channel(rgba.g),
+                    preview_channel(rgba.b),
+                    255,
+                ]),
+            );
+        }
+    }
+}
+
+fn preview_channel(value: f64) -> u8 {
+    if !value.is_finite() {
+        return 0;
+    }
+
+    (value.max(0.0).sqrt().min(1.0) * 255.999) as u8
+}
+
 fn write_kpcn_metadata(
     path: &str,
     width: u32,
@@ -738,6 +872,47 @@ fn write_kpcn_metadata(
     );
 
     fs::write(path, metadata)
+}
+
+fn write_relighting_metadata(
+    path: &str,
+    width: u32,
+    height: u32,
+    samples_per_pixel: u16,
+    path_file: &str,
+    output_file: &str,
+    lights: &[VirtualLight],
+) -> std::io::Result<()> {
+    if let Some(parent) = PathBuf::from(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let lights = lights
+        .iter()
+        .map(|light| {
+            serde_json::json!({
+                "position": [light.position.x, light.position.y, light.position.z],
+                "color": [light.color.r, light.color.g, light.color.b],
+                "intensity": light.intensity,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let metadata = serde_json::json!({
+        "mode": "relighting",
+        "width": width,
+        "height": height,
+        "samples_per_pixel": samples_per_pixel,
+        "path_file": path_file,
+        "output_file": output_file,
+        "virtual_lights": lights,
+    });
+    let metadata = serde_json::to_string_pretty(&metadata)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+
+    fs::write(path, format!("{metadata}\n"))
 }
 
 fn scene_quad_lights_as_virtual_lights(lights: &Arc<Vec<Object>>) -> Vec<VirtualLight> {
