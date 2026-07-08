@@ -10,10 +10,13 @@ mod lights;
 mod mat3;
 mod material;
 mod onb;
+mod path_packing;
 mod path_recording;
 mod pdf;
 mod ray;
 mod relighting;
+mod relight_editor;
+mod relight_pipeline;
 mod render;
 mod render_setup;
 mod sphere;
@@ -49,6 +52,12 @@ fn preview_window_requested(scene_file: &str) -> bool {
     let Ok(json) = serde_json::from_str::<serde_json::Value>(&data) else {
         return true;
     };
+
+    if let Some(backend) = json["settings"]["render_backend"].as_str() {
+        if backend.eq_ignore_ascii_case("relight_editor") {
+            return false;
+        }
+    }
 
     match &json["settings"]["preview_window"] {
         serde_json::Value::Bool(value) => *value,

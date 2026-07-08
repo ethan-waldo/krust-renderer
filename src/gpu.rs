@@ -18,6 +18,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+use crate::path_packing::{GpuPackedPathVertex, PACKED_PATH_VERTEX_SIZE, unpack_path_vertex};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -29,10 +30,23 @@ struct GpuParams {
     vertical: [f32; 4],
     counts: [u32; 4],
     render: [u32; 4],
+    chunk: [u32; 4],
 }
 
 unsafe impl bytemuck::Zeroable for GpuParams {}
 unsafe impl bytemuck::Pod for GpuParams {}
+
+/// Number of storage buffers the recorded path cache is split across so a
+/// single binding never exceeds `max_storage_buffer_binding_size` (4 GB). The
+/// record pass runs once per chunk (a contiguous range of samples), each
+/// dispatch writing into its own buffer, so the record shader itself keeps to
+/// the 8-storage-buffer compute limit.
+pub const PATH_CHUNK_COUNT: usize = 4;
+
+/// Samples-per-chunk given a total sample count.
+pub fn path_chunk_spp(samples_per_pixel: u64) -> u64 {
+    (samples_per_pixel + PATH_CHUNK_COUNT as u64 - 1) / PATH_CHUNK_COUNT as u64
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -112,16 +126,74 @@ unsafe impl bytemuck::Pod for GpuPixel {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
-struct GpuPathVertex {
-    position: [f32; 4],
-    throughput: [f32; 4],
-    outgoing: [f32; 4],
-    pixel: [u32; 4],
-    flags: [u32; 4],
+pub struct GpuPathVertex {
+    pub position: [f32; 4],
+    pub throughput: [f32; 4],
+    pub outgoing: [f32; 4],
+    pub pixel: [u32; 4],
+    pub flags: [u32; 4],
 }
 
 unsafe impl bytemuck::Zeroable for GpuPathVertex {}
 unsafe impl bytemuck::Pod for GpuPathVertex {}
+
+/// GPU-resident packed path cache returned by path recording.
+pub struct GpuPathCache {
+    pub instance: wgpu::Instance,
+    pub adapter: wgpu::Adapter,
+    pub device: wgpu::Device,
+    pub queue: wgpu::Queue,
+    /// Path vertices split across up to `PATH_CHUNK_COUNT` storage buffers,
+    /// partitioned by sample range.
+    pub path_chunks: Vec<wgpu::Buffer>,
+    /// Samples per chunk (used to map a global sample index to chunk + local).
+    pub chunk_spp: u64,
+    /// Valid vertex count in each chunk (last chunk may hold fewer samples).
+    pub chunk_valid_counts: Vec<u64>,
+    pub path_count: u64,
+}
+
+pub fn read_path_vertices_from_chunks(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    chunks: &[wgpu::Buffer],
+    chunk_valid_counts: &[u64],
+    path_count: u64,
+) -> Result<Vec<GpuPathVertex>, Box<dyn Error>> {
+    let mut records = Vec::with_capacity(path_count as usize);
+    for (chunk, &count) in chunks.iter().zip(chunk_valid_counts.iter()) {
+        if count == 0 {
+            continue;
+        }
+        let bytes = count * PACKED_PATH_VERTEX_SIZE as u64;
+        let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("krust gpu path readback staging"),
+            size: bytes,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("krust gpu path readback encoder"),
+        });
+        encoder.copy_buffer_to_buffer(chunk, 0, &staging_buffer, 0, bytes);
+        queue.submit(Some(encoder.finish()));
+
+        let buffer_slice = staging_buffer.slice(..);
+        let (sender, receiver) = mpsc::channel();
+        buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = sender.send(result);
+        });
+        device.poll(wgpu::Maintain::Wait);
+        receiver.recv()??;
+
+        let mapped = buffer_slice.get_mapped_range();
+        let packed: &[GpuPackedPathVertex] = bytemuck::cast_slice(&mapped);
+        records.extend(packed.iter().map(unpack_path_vertex));
+        drop(mapped);
+        staging_buffer.unmap();
+    }
+    Ok(records)
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -229,16 +301,74 @@ pub fn record_scene_paths(
     objects: &[Arc<Object>],
     directional_lights: &[DirectionalLight],
 ) -> Result<usize, Box<dyn Error>> {
+    let records = record_scene_paths_gpu(
+        width,
+        height,
+        samples_per_pixel,
+        max_depth,
+        camera,
+        objects,
+        directional_lights,
+    )?;
+    write_path_records_from_vertices(path, &records)
+}
+
+pub fn record_scene_paths_gpu(
+    width: u32,
+    height: u32,
+    samples_per_pixel: u16,
+    max_depth: u32,
+    camera: &Camera,
+    objects: &[Arc<Object>],
+    directional_lights: &[DirectionalLight],
+) -> Result<Vec<GpuPathVertex>, Box<dyn Error>> {
+    let cache = record_scene_paths_gpu_resident(
+        width,
+        height,
+        samples_per_pixel,
+        max_depth,
+        camera,
+        objects,
+        directional_lights,
+    )?;
+    read_path_vertices_from_chunks(
+        &cache.device,
+        &cache.queue,
+        &cache.path_chunks,
+        &cache.chunk_valid_counts,
+        cache.path_count,
+    )
+}
+
+pub fn record_scene_paths_gpu_resident(
+    width: u32,
+    height: u32,
+    samples_per_pixel: u16,
+    max_depth: u32,
+    camera: &Camera,
+    objects: &[Arc<Object>],
+    directional_lights: &[DirectionalLight],
+) -> Result<GpuPathCache, Box<dyn Error>> {
     let scene = GpuScene::from_objects(objects, directional_lights);
-    let records = block_on(run_path_record_shader(
+    block_on(run_path_record_shader_resident(
         width,
         height,
         samples_per_pixel.max(1) as u32,
         max_depth.max(1),
         camera,
         &scene,
-    ))?;
-    write_path_records(path, &records)
+    ))
+}
+
+pub fn write_path_records_from_vertices(
+    path: impl AsRef<Path>,
+    records: &[GpuPathVertex],
+) -> Result<usize, Box<dyn Error>> {
+    write_path_records(path, records)
+}
+
+pub async fn request_adapter_async() -> Result<(wgpu::Instance, wgpu::Adapter), Box<dyn Error>> {
+    request_adapter().await
 }
 
 impl GpuScene {
@@ -616,6 +746,7 @@ async fn run_shader(
             scene.directional_lights.len() as u32,
             scene.quad_lights.len() as u32,
         ],
+        chunk: [0, 0, 0, 0],
     };
 
     let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -779,15 +910,15 @@ async fn run_shader(
     Ok(pixels)
 }
 
-async fn run_path_record_shader(
+async fn run_path_record_shader_resident(
     width: u32,
     height: u32,
     samples_per_pixel: u32,
     max_depth: u32,
     camera: &Camera,
     scene: &GpuScene,
-) -> Result<Vec<GpuPathVertex>, Box<dyn Error>> {
-    let (_instance, adapter) = request_adapter().await?;
+) -> Result<GpuPathCache, Box<dyn Error>> {
+    let (instance, adapter) = request_adapter().await?;
     let adapter_info = adapter.get_info();
     eprintln!(
         "Using GPU adapter for path recording: {} ({:?}, {:?})",
@@ -806,7 +937,10 @@ async fn run_path_record_shader(
         .await?;
 
     let (origin, lower_left, horizontal, vertical) = camera.raster_basis();
-    let params = GpuParams {
+    let spp = (samples_per_pixel as u64).max(1);
+    let depth = (max_depth as u64).max(1);
+    let chunk_spp = path_chunk_spp(spp);
+    let base_params = GpuParams {
         origin: vec4(origin, 0.0),
         lower_left: vec4(lower_left, 0.0),
         horizontal: vec4(horizontal, 0.0),
@@ -818,18 +952,16 @@ async fn run_path_record_shader(
             scene.tris.len() as u32,
         ],
         render: [
-            samples_per_pixel.max(1),
-            max_depth.max(1),
+            spp as u32,
+            depth as u32,
             scene.directional_lights.len() as u32,
             scene.quad_lights.len() as u32,
         ],
+        // chunk = [chunk_spp, sample_offset, sample_count, chunk_count];
+        // sample_offset / sample_count are filled in per dispatch below.
+        chunk: [chunk_spp as u32, 0, 0, PATH_CHUNK_COUNT as u32],
     };
 
-    let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-        label: Some("krust gpu path params"),
-        contents: bytemuck::bytes_of(&params),
-        usage: wgpu::BufferUsages::UNIFORM,
-    });
     let materials_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("krust gpu path materials"),
         contents: bytemuck::cast_slice(&scene.materials),
@@ -866,20 +998,20 @@ async fn run_path_record_shader(
         usage: wgpu::BufferUsages::STORAGE,
     });
 
-    let record_count = width as u64 * height as u64 * samples_per_pixel as u64 * max_depth as u64;
-    let output_size = record_count * size_of::<GpuPathVertex>() as u64;
-    let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("krust gpu path output"),
-        size: output_size,
-        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
-        mapped_at_creation: false,
-    });
-    let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("krust gpu path staging"),
-        size: output_size,
-        usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
+    // Each chunk buffer is laid out with a fixed `chunk_spp` stride per pixel,
+    // so every chunk holds w * h * chunk_spp * depth vertices.
+    let chunk_vertices = width as u64 * height as u64 * chunk_spp * depth;
+    let chunk_bytes = chunk_vertices * PACKED_PATH_VERTEX_SIZE as u64;
+    let output_chunks: Vec<wgpu::Buffer> = (0..PATH_CHUNK_COUNT)
+        .map(|_| {
+            device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("krust gpu path output chunk"),
+                size: chunk_bytes.max(PACKED_PATH_VERTEX_SIZE as u64),
+                usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            })
+        })
+        .collect();
 
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("krust gpu path record shader"),
@@ -942,49 +1074,79 @@ async fn run_path_record_shader(
         module: &shader,
         entry_point: "main",
     });
-    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("krust gpu path bind group"),
-        layout: &bind_group_layout,
-        entries: &[
-            bind_resource(0, &params_buffer),
-            bind_resource(1, &materials_buffer),
-            bind_resource(2, &spheres_buffer),
-            bind_resource(3, &tris_buffer),
-            bind_resource(4, &output_buffer),
-            bind_resource(5, &textures_buffer),
-            bind_resource(6, &texels_buffer),
-            bind_resource(7, &directional_lights_buffer),
-            bind_resource(8, &quad_lights_buffer),
-        ],
-    });
-
+    // One dispatch per chunk, each covering a contiguous sample range and
+    // writing into its own output buffer. This keeps the record shader within
+    // the 8-storage-buffer compute limit while splitting the cache so no single
+    // storage binding exceeds max_storage_buffer_binding_size.
     let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
         label: Some("krust gpu path record encoder"),
     });
-    {
+    let mut chunk_valid_counts = vec![0u64; PATH_CHUNK_COUNT];
+    let mut param_buffers = Vec::with_capacity(PATH_CHUNK_COUNT);
+    let mut bind_groups = Vec::with_capacity(PATH_CHUNK_COUNT);
+    for chunk in 0..PATH_CHUNK_COUNT {
+        let sample_offset = chunk as u64 * chunk_spp;
+        let sample_count = if sample_offset >= spp {
+            0
+        } else {
+            chunk_spp.min(spp - sample_offset)
+        };
+        chunk_valid_counts[chunk] = if sample_count == 0 { 0 } else { chunk_vertices };
+
+        let mut params = base_params;
+        params.chunk = [
+            chunk_spp as u32,
+            sample_offset as u32,
+            sample_count as u32,
+            PATH_CHUNK_COUNT as u32,
+        ];
+        let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("krust gpu path params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        param_buffers.push(params_buffer);
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("krust gpu path bind group"),
+            layout: &bind_group_layout,
+            entries: &[
+                bind_resource(0, &param_buffers[chunk]),
+                bind_resource(1, &materials_buffer),
+                bind_resource(2, &spheres_buffer),
+                bind_resource(3, &tris_buffer),
+                bind_resource(4, &output_chunks[chunk]),
+                bind_resource(5, &textures_buffer),
+                bind_resource(6, &texels_buffer),
+                bind_resource(7, &directional_lights_buffer),
+                bind_resource(8, &quad_lights_buffer),
+            ],
+        });
+        bind_groups.push(bind_group);
+    }
+    for chunk in 0..PATH_CHUNK_COUNT {
+        if chunk_valid_counts[chunk] == 0 {
+            continue;
+        }
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("krust gpu path record pass"),
         });
         pass.set_pipeline(&pipeline);
-        pass.set_bind_group(0, &bind_group, &[]);
+        pass.set_bind_group(0, &bind_groups[chunk], &[]);
         pass.dispatch_workgroups((width + 7) / 8, (height + 7) / 8, 1);
     }
-    encoder.copy_buffer_to_buffer(&output_buffer, 0, &staging_buffer, 0, output_size);
     queue.submit(Some(encoder.finish()));
 
-    let buffer_slice = staging_buffer.slice(..);
-    let (sender, receiver) = mpsc::channel();
-    buffer_slice.map_async(wgpu::MapMode::Read, move |result| {
-        let _ = sender.send(result);
-    });
-    device.poll(wgpu::Maintain::Wait);
-    receiver.recv()??;
-
-    let mapped = buffer_slice.get_mapped_range();
-    let records = bytemuck::cast_slice(&mapped).to_vec();
-    drop(mapped);
-    staging_buffer.unmap();
-    Ok(records)
+    let record_count = width as u64 * height as u64 * spp * depth;
+    Ok(GpuPathCache {
+        instance,
+        adapter,
+        device,
+        queue,
+        path_chunks: output_chunks,
+        chunk_spp,
+        chunk_valid_counts,
+        path_count: record_count,
+    })
 }
 
 fn write_path_records(
@@ -2247,6 +2409,7 @@ struct Params {
     vertical: vec4<f32>,
     counts: vec4<u32>,
     render: vec4<u32>,
+    chunk: vec4<u32>,
 };
 
 struct Material {
@@ -2307,36 +2470,72 @@ struct Hit {
     material: u32,
 };
 
-struct PathVertex {
-    position: vec4<f32>,
-    throughput: vec4<f32>,
-    outgoing: vec4<f32>,
-    pixel: vec4<u32>,
-    flags: vec4<u32>,
+struct PackedPathVertex {
+    words: array<u32, 8>,
 };
 
 @group(0) @binding(0) var<uniform> params: Params;
 @group(0) @binding(1) var<storage, read> materials: array<Material>;
 @group(0) @binding(2) var<storage, read> spheres: array<Sphere>;
 @group(0) @binding(3) var<storage, read> tris: array<Tri>;
-@group(0) @binding(4) var<storage, read_write> output: array<PathVertex>;
+@group(0) @binding(4) var<storage, read_write> output: array<PackedPathVertex>;
 @group(0) @binding(5) var<storage, read> texture_infos: array<TextureInfo>;
 @group(0) @binding(6) var<storage, read> texels: array<Texel>;
 @group(0) @binding(7) var<storage, read> directional_lights: array<DirectionalLight>;
 @group(0) @binding(8) var<storage, read> quad_lights: array<QuadLight>;
 
-fn output_index(pixel: vec2<u32>, sample_idx: u32, depth: u32) -> u32 {
-    return (((pixel.y * params.counts.x + pixel.x) * params.render.x + sample_idx) * params.render.y) + depth;
+fn pack_rgb9e5(c: vec3<f32>) -> u32 {
+    let r = max(c.r, 0.0);
+    let g = max(c.g, 0.0);
+    let b = max(c.b, 0.0);
+    let max_c = max(max(r, g), max(b, 1e-20));
+    let exp_f = ceil(log2(max_c));
+    let exp = u32(clamp(exp_f, -15.0, 15.0) + 15.0);
+    let scale = exp2(f32(i32(exp) - 15 - 9));
+    let r9 = min(u32(round(r / scale)), 511u);
+    let g9 = min(u32(round(g / scale)), 511u);
+    let b9 = min(u32(round(b / scale)), 511u);
+    return (exp << 27u) | (r9 << 18u) | (g9 << 9u) | b9;
 }
 
-fn inactive_vertex(pixel: vec2<u32>, sample_idx: u32, depth: u32) -> PathVertex {
-    var vertex: PathVertex;
-    vertex.position = vec4<f32>(0.0);
-    vertex.throughput = vec4<f32>(0.0);
-    vertex.outgoing = vec4<f32>(0.0);
-    vertex.pixel = vec4<u32>(pixel.x, pixel.y, sample_idx, depth);
-    vertex.flags = vec4<u32>(0u);
-    return vertex;
+fn pack_vertex(
+    pos: vec3<f32>,
+    throughput: vec3<f32>,
+    outgoing: vec3<f32>,
+    pixel: vec4<u32>,
+    is_active: u32,
+    terminated: u32,
+) -> PackedPathVertex {
+    var packed: PackedPathVertex;
+    packed.words[0] = pack2x16float(vec2<f32>(pos.x, pos.y));
+    packed.words[1] = pack2x16float(vec2<f32>(pos.z, outgoing.x));
+    packed.words[2] = pack2x16float(vec2<f32>(outgoing.y, outgoing.z));
+    packed.words[3] = pack_rgb9e5(throughput);
+    packed.words[4] = pixel.x | (pixel.y << 16u);
+    packed.words[5] = pixel.z | (pixel.w << 16u);
+    packed.words[6] = is_active | (terminated << 8u);
+    packed.words[7] = 0u;
+    return packed;
+}
+
+fn output_index(pixel: vec2<u32>, sample_idx: u32, depth: u32) -> u32 {
+    // Each dispatch writes only the samples [sample_offset, sample_offset+sample_count)
+    // for this chunk into a buffer laid out with chunk_spp samples per pixel.
+    let chunk_spp = params.chunk.x;
+    let sample_offset = params.chunk.y;
+    let local_sample = sample_idx - sample_offset;
+    return (((pixel.y * params.counts.x + pixel.x) * chunk_spp + local_sample) * params.render.y) + depth;
+}
+
+fn inactive_vertex(pixel: vec2<u32>, sample_idx: u32, depth: u32) -> PackedPathVertex {
+    return pack_vertex(
+        vec3<f32>(0.0),
+        vec3<f32>(0.0),
+        vec3<f32>(0.0),
+        vec4<u32>(pixel.x, pixel.y, sample_idx, depth),
+        0u,
+        0u,
+    );
 }
 
 fn hit_sphere(ray_origin: vec3<f32>, ray_dir: vec3<f32>, sphere: Sphere, best_t: f32) -> Hit {
@@ -2530,17 +2729,18 @@ fn refract_dir(v: vec3<f32>, n: vec3<f32>, eta: f32) -> vec3<f32> {
 }
 
 fn write_record(pixel: vec2<u32>, sample_idx: u32, depth: u32, hit: Hit, throughput: vec3<f32>, outgoing: vec3<f32>, terminated: bool) {
-    var vertex: PathVertex;
-    vertex.position = vec4<f32>(hit.position, 1.0);
-    vertex.throughput = vec4<f32>(throughput, 1.0);
-    vertex.outgoing = vec4<f32>(outgoing, 0.0);
-    vertex.pixel = vec4<u32>(pixel.x, pixel.y, sample_idx, depth);
     var terminated_flag = 0u;
     if (terminated) {
         terminated_flag = 1u;
     }
-    vertex.flags = vec4<u32>(1u, terminated_flag, 0u, 0u);
-    output[output_index(pixel, sample_idx, depth)] = vertex;
+    output[output_index(pixel, sample_idx, depth)] = pack_vertex(
+        hit.position,
+        throughput,
+        outgoing,
+        vec4<u32>(pixel.x, pixel.y, sample_idx, depth),
+        1u,
+        terminated_flag,
+    );
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -2552,12 +2752,22 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
 
     let pixel = id.xy;
-    let spp = max(params.render.x, 1u);
     let max_depth = max(params.render.y, 1u);
-    for (var sample_idx = 0u; sample_idx < spp; sample_idx = sample_idx + 1u) {
+    let chunk_spp = params.chunk.x;
+    let sample_offset = params.chunk.y;
+    let sample_count = params.chunk.z;
+
+    // Initialize this chunk's full sample stride to inactive so the tail of a
+    // partially-filled chunk never contains uninitialized memory on readback.
+    for (var local = 0u; local < chunk_spp; local = local + 1u) {
+        let init_sample = sample_offset + local;
         for (var depth = 0u; depth < max_depth; depth = depth + 1u) {
-            output[output_index(pixel, sample_idx, depth)] = inactive_vertex(pixel, sample_idx, depth);
+            output[output_index(pixel, init_sample, depth)] = inactive_vertex(pixel, init_sample, depth);
         }
+    }
+
+    let sample_end = sample_offset + sample_count;
+    for (var sample_idx = sample_offset; sample_idx < sample_end; sample_idx = sample_idx + 1u) {
 
         var rng = (pixel.x + 1u) * 1973u ^ (pixel.y + 1u) * 9277u ^ (sample_idx + 1u) * 26699u;
         let denom_x = max(f32(width - 1u), 1.0);

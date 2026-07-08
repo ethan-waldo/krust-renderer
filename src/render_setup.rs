@@ -71,7 +71,14 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     ));
     let spp: u16 = data["settings"]["spp"].as_u64().unwrap() as u16;
     let depth: u32 = data["settings"]["depth"].as_u64().unwrap() as u32;
-    let preview_window = setting_bool(&data["settings"], "preview_window", true);
+    // The relight editor drives its own winit window and runs outside the
+    // show-image global context, so creating a show-image preview here would
+    // panic. Force it off for that backend regardless of the scene setting.
+    let is_relight_editor = setting_string(&data["settings"], "render_backend")
+        .map(|b| b.eq_ignore_ascii_case("relight_editor"))
+        .unwrap_or(false);
+    let preview_window =
+        setting_bool(&data["settings"], "preview_window", true) && !is_relight_editor;
 
     // create viewer
     let preview: RgbaImage = ImageBuffer::new(width, height);
@@ -426,6 +433,43 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
 
     println!("Processing BVH...");
     let world_bvh = Arc::new(Object::Bvh(Bvh::new(&mut world.objects, 0.0, 1.0)));
+
+    if render_backend == "relight_editor" {
+        let path_spp = setting_u32(&data["settings"], "path_spp", 1).max(1);
+        let path_depth = setting_u32(&data["settings"], "path_depth", depth).max(1);
+        let mut virtual_lights = relighting::virtual_lights_from_json(&data["settings"]);
+        if virtual_lights.is_empty() {
+            virtual_lights = scene_quad_lights_as_virtual_lights(&quad_lights);
+        }
+        let export_jsonl = if setting_bool(&data["settings"], "record_paths", false) {
+            Some(PathBuf::from(
+                setting_string(&data["settings"], "path_output_file")
+                    .unwrap_or_else(|| output_path(output_dir, "krust_paths.jsonl")),
+            ))
+        } else {
+            None
+        };
+        let nrp_weights = setting_string(&data["settings"], "nrp_weights_file")
+            .map(PathBuf::from);
+        if let Err(err) = crate::relight_editor::run(
+            camera.clone(),
+            Arc::new(world.objects.clone()),
+            dir_lights.clone(),
+            virtual_lights,
+            crate::relight_editor::RelightEditorSettings {
+                width,
+                height,
+                path_spp,
+                path_depth,
+                export_jsonl,
+                nrp_weights,
+                output_dir: PathBuf::from(output_dir),
+            },
+        ) {
+            panic!("Relight editor failed: {err}");
+        }
+        return;
+    }
 
     //----------------------------------------------------------------------------------
     //----------------------------------------------------------------------------------
