@@ -4,10 +4,13 @@ use crate::color::Color;
 use crate::hit::Object;
 use crate::lights::{DirectionalLight, QuadLight};
 use crate::material::{Emits, Material};
+use crate::path_packing::{unpack_path_vertex, GpuPackedPathVertex, PACKED_PATH_VERTEX_SIZE};
 use crate::texture::TextureMap;
 use crate::tri::Tri;
 use crate::vec3::Vec3;
+use console::Term;
 use image::{ImageBuffer, Rgba32FImage};
+use indicatif::{ProgressBar, ProgressDrawTarget, ProgressStyle};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File;
@@ -18,7 +21,6 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use crate::path_packing::{GpuPackedPathVertex, PACKED_PATH_VERTEX_SIZE, unpack_path_vertex};
 use wgpu::util::DeviceExt;
 
 #[repr(C)]
@@ -161,10 +163,17 @@ pub fn read_path_vertices_from_chunks(
     path_count: u64,
 ) -> Result<Vec<GpuPathVertex>, Box<dyn Error>> {
     let mut records = Vec::with_capacity(path_count as usize);
-    for (chunk, &count) in chunks.iter().zip(chunk_valid_counts.iter()) {
+    let active_chunks = chunk_valid_counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .count() as u64;
+    let mut progress = PathProgress::new("Path readback", active_chunks);
+    let mut completed_chunks = 0u64;
+    for (chunk_index, (chunk, &count)) in chunks.iter().zip(chunk_valid_counts.iter()).enumerate() {
         if count == 0 {
             continue;
         }
+        progress.message(format!("chunk {}/{}", chunk_index + 1, chunks.len()));
         let bytes = count * PACKED_PATH_VERTEX_SIZE as u64;
         let staging_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("krust gpu path readback staging"),
@@ -191,7 +200,10 @@ pub fn read_path_vertices_from_chunks(
         records.extend(packed.iter().map(unpack_path_vertex));
         drop(mapped);
         staging_buffer.unmap();
+        completed_chunks += 1;
+        progress.set(completed_chunks, "chunks");
     }
+    progress.finish("complete");
     Ok(records)
 }
 
@@ -365,10 +377,6 @@ pub fn write_path_records_from_vertices(
     records: &[GpuPathVertex],
 ) -> Result<usize, Box<dyn Error>> {
     write_path_records(path, records)
-}
-
-pub async fn request_adapter_async() -> Result<(wgpu::Instance, wgpu::Adapter), Box<dyn Error>> {
-    request_adapter().await
 }
 
 impl GpuScene {
@@ -1078,9 +1086,6 @@ async fn run_path_record_shader_resident(
     // writing into its own output buffer. This keeps the record shader within
     // the 8-storage-buffer compute limit while splitting the cache so no single
     // storage binding exceeds max_storage_buffer_binding_size.
-    let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        label: Some("krust gpu path record encoder"),
-    });
     let mut chunk_valid_counts = vec![0u64; PATH_CHUNK_COUNT];
     let mut param_buffers = Vec::with_capacity(PATH_CHUNK_COUNT);
     let mut bind_groups = Vec::with_capacity(PATH_CHUNK_COUNT);
@@ -1123,18 +1128,33 @@ async fn run_path_record_shader_resident(
         });
         bind_groups.push(bind_group);
     }
+    let active_chunks = chunk_valid_counts
+        .iter()
+        .filter(|&&count| count > 0)
+        .count() as u64;
+    let mut progress = PathProgress::new("Path record", active_chunks);
+    let mut completed_chunks = 0u64;
     for chunk in 0..PATH_CHUNK_COUNT {
         if chunk_valid_counts[chunk] == 0 {
             continue;
         }
+        progress.message(format!("chunk {}/{}", chunk + 1, PATH_CHUNK_COUNT));
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("krust gpu path record encoder"),
+        });
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("krust gpu path record pass"),
         });
         pass.set_pipeline(&pipeline);
         pass.set_bind_group(0, &bind_groups[chunk], &[]);
         pass.dispatch_workgroups((width + 7) / 8, (height + 7) / 8, 1);
+        drop(pass);
+        queue.submit(Some(encoder.finish()));
+        device.poll(wgpu::Maintain::Wait);
+        completed_chunks += 1;
+        progress.set(completed_chunks, "chunks");
     }
-    queue.submit(Some(encoder.finish()));
+    progress.finish("complete");
 
     let record_count = width as u64 * height as u64 * spp * depth;
     Ok(GpuPathCache {
@@ -1161,32 +1181,119 @@ fn write_path_records(
 
     let mut written = 0;
     let mut file = File::create(path)?;
-    for record in records {
-        if record.flags[0] == 0 {
-            continue;
+    let total = records.len().max(1);
+    let mut progress = PathProgress::new("Path JSONL", total as u64);
+    for (index, record) in records.iter().enumerate() {
+        if record.flags[0] != 0 {
+            writeln!(
+                file,
+                "{{\"x\":{},\"y\":{},\"sample\":{},\"depth\":{},\"position\":[{:.8},{:.8},{:.8}],\"throughput\":[{:.8},{:.8},{:.8}],\"outgoing\":[{:.8},{:.8},{:.8}],\"terminated\":{}}}",
+                record.pixel[0],
+                record.pixel[1],
+                record.pixel[2],
+                record.pixel[3],
+                record.position[0],
+                record.position[1],
+                record.position[2],
+                record.throughput[0],
+                record.throughput[1],
+                record.throughput[2],
+                record.outgoing[0],
+                record.outgoing[1],
+                record.outgoing[2],
+                record.flags[1] != 0,
+            )?;
+            written += 1;
         }
-        writeln!(
-            file,
-            "{{\"x\":{},\"y\":{},\"sample\":{},\"depth\":{},\"position\":[{:.8},{:.8},{:.8}],\"throughput\":[{:.8},{:.8},{:.8}],\"outgoing\":[{:.8},{:.8},{:.8}],\"terminated\":{}}}",
-            record.pixel[0],
-            record.pixel[1],
-            record.pixel[2],
-            record.pixel[3],
-            record.position[0],
-            record.position[1],
-            record.position[2],
-            record.throughput[0],
-            record.throughput[1],
-            record.throughput[2],
-            record.outgoing[0],
-            record.outgoing[1],
-            record.outgoing[2],
-            record.flags[1] != 0,
-        )?;
-        written += 1;
+
+        progress.set(index as u64 + 1, &format!("{written} records"));
     }
+    progress.finish(format!("{written} records"));
 
     Ok(written)
+}
+
+enum PathProgress {
+    Bar(ProgressBar),
+    Log {
+        label: &'static str,
+        len: u64,
+        next_percent: u64,
+    },
+}
+
+impl PathProgress {
+    fn new(label: &'static str, len: u64) -> Self {
+        if use_progress_bar() {
+            let bar = ProgressBar::with_draw_target(
+                Some(len.max(1)),
+                ProgressDrawTarget::stderr_with_hz(4),
+            );
+            bar.set_style(
+                ProgressStyle::with_template(&format!(
+                    "{label} [{{elapsed_precise}}] {{bar:40.gray}} {{pos}}/{{len}} {{msg}}"
+                ))
+                .unwrap(),
+            );
+            Self::Bar(bar)
+        } else {
+            eprintln!("{label}: 0/{}", len.max(1));
+            Self::Log {
+                label,
+                len: len.max(1),
+                next_percent: 10,
+            }
+        }
+    }
+
+    fn message(&mut self, message: String) {
+        match self {
+            Self::Bar(bar) => bar.set_message(message),
+            Self::Log { label, .. } => eprintln!("{label}: {message}"),
+        }
+    }
+
+    fn set(&mut self, pos: u64, message: &str) {
+        match self {
+            Self::Bar(bar) => {
+                bar.set_position(pos);
+                bar.set_message(message.to_string());
+            }
+            Self::Log {
+                label,
+                len,
+                next_percent,
+            } => {
+                let percent = pos.saturating_mul(100) / *len;
+                if percent >= *next_percent || pos >= *len {
+                    eprintln!("{label}: {percent}% ({message})");
+                    *next_percent += 10;
+                }
+            }
+        }
+    }
+
+    fn finish(&self, message: impl Into<String>) {
+        let message = message.into();
+        match self {
+            Self::Bar(bar) => bar.finish_with_message(message),
+            Self::Log { label, .. } => eprintln!("{label}: complete ({message})"),
+        }
+    }
+}
+
+fn use_progress_bar() -> bool {
+    match std::env::var("KRUST_PROGRESS") {
+        Ok(value) if value.eq_ignore_ascii_case("bar") => return true,
+        Ok(value) if value.eq_ignore_ascii_case("log") => return false,
+        _ => {}
+    }
+
+    let term = Term::stderr();
+    term.is_term()
+        && std::env::var("TERM")
+            .map(|term| term != "dumb")
+            .unwrap_or(false)
 }
 
 async fn request_adapter() -> Result<(wgpu::Instance, wgpu::Adapter), Box<dyn Error>> {

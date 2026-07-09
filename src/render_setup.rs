@@ -22,6 +22,7 @@ use show_image::{create_window, ImageInfo, ImageView, WindowOptions};
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::{fs, thread};
 
@@ -74,11 +75,15 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     // The relight editor drives its own winit window and runs outside the
     // show-image global context, so creating a show-image preview here would
     // panic. Force it off for that backend regardless of the scene setting.
+    let opens_relight_editor_after_render =
+        setting_bool(&data["settings"], "open_relight_editor_after_render", false)
+            || setting_bool(&data["settings"], "open_relight_editor", false);
     let is_relight_editor = setting_string(&data["settings"], "render_backend")
         .map(|b| b.eq_ignore_ascii_case("relight_editor"))
         .unwrap_or(false);
-    let preview_window =
-        setting_bool(&data["settings"], "preview_window", true) && !is_relight_editor;
+    let preview_window = setting_bool(&data["settings"], "preview_window", true)
+        && !is_relight_editor
+        && !opens_relight_editor_after_render;
 
     // create viewer
     let preview: RgbaImage = ImageBuffer::new(width, height);
@@ -433,36 +438,40 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
 
     println!("Processing BVH...");
     let world_bvh = Arc::new(Object::Bvh(Bvh::new(&mut world.objects, 0.0, 1.0)));
+    let relighting_settings = RelightingSettings::from_json(&data["settings"], output_dir, depth);
+    let relight_editor_width = setting_u32(&data["settings"], "relight_editor_width", width);
+    let relight_editor_height = setting_u32(
+        &data["settings"],
+        "relight_editor_height",
+        (relight_editor_width as f64 / aspect_ratio) as u32,
+    );
+    let relight_editor_start_nrp =
+        setting_bool(&data["settings"], "relight_editor_start_nrp", true);
 
     if render_backend == "relight_editor" {
-        let path_spp = setting_u32(&data["settings"], "path_spp", 1).max(1);
-        let path_depth = setting_u32(&data["settings"], "path_depth", depth).max(1);
         let mut virtual_lights = relighting::virtual_lights_from_json(&data["settings"]);
         if virtual_lights.is_empty() {
             virtual_lights = scene_quad_lights_as_virtual_lights(&quad_lights);
         }
-        let export_jsonl = if setting_bool(&data["settings"], "record_paths", false) {
-            Some(PathBuf::from(
-                setting_string(&data["settings"], "path_output_file")
-                    .unwrap_or_else(|| output_path(output_dir, "krust_paths.jsonl")),
-            ))
+        let export_jsonl = if relighting_settings.record_paths {
+            Some(PathBuf::from(&relighting_settings.path_output))
         } else {
             None
         };
-        let nrp_weights = setting_string(&data["settings"], "nrp_weights_file")
-            .map(PathBuf::from);
+        let nrp_weights = setting_string(&data["settings"], "nrp_weights_file").map(PathBuf::from);
         if let Err(err) = crate::relight_editor::run(
             camera.clone(),
             Arc::new(world.objects.clone()),
             dir_lights.clone(),
             virtual_lights,
             crate::relight_editor::RelightEditorSettings {
-                width,
-                height,
-                path_spp,
-                path_depth,
+                width: relight_editor_width,
+                height: relight_editor_height,
+                path_spp: relighting_settings.path_spp as u32,
+                path_depth: relighting_settings.path_depth,
                 export_jsonl,
                 nrp_weights,
+                start_nrp: relight_editor_start_nrp,
                 output_dir: PathBuf::from(output_dir),
             },
         ) {
@@ -627,7 +636,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
         buffers
     };
 
-    if !setting_bool(&data["settings"], "relight_only", false) {
+    if !relighting_settings.relight_only {
         let dataset_settings = DatasetSettings::from_json(&data["settings"], spp, output_dir);
         if dataset_settings.enabled {
             let noisy_buffers = render_pass(dataset_settings.noisy_spp, &output_file, "KPCN noisy");
@@ -671,90 +680,166 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
         }
     }
 
-    let path_output = setting_string(&data["settings"], "path_output_file")
-        .unwrap_or_else(|| output_path(output_dir, "krust_paths.jsonl"));
-    if setting_bool(&data["settings"], "record_paths", false) {
-        let path_spp = setting_u16(&data["settings"], "path_spp", 1).max(1);
-        let path_depth = setting_u32(&data["settings"], "path_depth", depth).max(1);
-        let gpu_record_paths =
-            render_backend == "gpu" || render_backend == "gpu_aov" || render_backend == "webgpu";
-        let gpu_recorded = if gpu_record_paths {
-            match gpu::record_scene_paths(
-                &path_output,
-                width,
-                height,
-                path_spp,
-                path_depth,
-                camera.as_ref(),
-                &world.objects,
-                dir_lights.as_ref(),
-            ) {
-                Ok(count) => {
-                    eprintln!("Recorded {count} light-agnostic GPU path vertices.");
-                    true
-                }
-                Err(err) => {
-                    panic!("GPU path recording failed: {err}");
-                }
-            }
-        } else {
-            false
-        };
-
-        if !gpu_recorded {
-            if let Err(err) = path_recording::record_scene_paths(
-                &path_output,
-                width,
-                height,
-                path_spp,
-                path_depth,
-                camera.clone(),
-                world_bvh.clone(),
-            ) {
-                eprintln!("Failed to record light-agnostic paths: {err}");
-            }
+    if relighting_settings.record_paths && !relighting_settings.gather {
+        if let Err(err) = record_light_agnostic_paths(
+            &relighting_settings.path_output,
+            width,
+            height,
+            &relighting_settings,
+            &render_backend,
+            camera.as_ref(),
+            &world.objects,
+            dir_lights.as_ref(),
+            camera.clone(),
+            world_bvh.clone(),
+        ) {
+            panic!("Failed to record light-agnostic paths: {err}");
         }
     }
 
-    if setting_bool(&data["settings"], "gather_relighting", false) {
-        let relight_spp = setting_u16(
-            &data["settings"],
-            "relight_path_spp",
-            setting_u16(&data["settings"], "path_spp", 1),
-        )
-        .max(1);
-        let relight_path = setting_string(&data["settings"], "relight_path_file")
-            .unwrap_or_else(|| path_output.clone());
-        let relight_output = setting_string(&data["settings"], "relight_output_file")
-            .unwrap_or_else(|| output_path(output_dir, "krust_relight.exr"));
-        let relight_metadata = setting_string(&data["settings"], "relight_metadata_file")
-            .unwrap_or_else(|| output_path(output_dir, "krust_relight.json"));
+    if relighting_settings.gather {
         let mut virtual_lights = relighting::virtual_lights_from_json(&data["settings"]);
         if virtual_lights.is_empty() {
             virtual_lights = scene_quad_lights_as_virtual_lights(&quad_lights);
         }
 
-        if let Err(err) = relighting::gather_light_from_paths(
-            &relight_path,
-            &relight_output,
+        let nrp_weights = PathBuf::from(&relighting_settings.nrp_weights);
+        let should_train_nrp =
+            relighting_settings.retrain_nrp || nrp_weights_need_training(&relighting_settings);
+        if should_train_nrp {
+            if !relighting_settings.auto_train_nrp {
+                panic!(
+                    "NRP weights at {} are missing or stale and auto_train_nrp is disabled.",
+                    nrp_weights.display()
+                );
+            }
+
+            if relighting_settings.record_paths
+                || !PathBuf::from(&relighting_settings.relight_path).exists()
+            {
+                eprintln!(
+                    "NRP 1/3: recording light-agnostic paths for training -> {}",
+                    relighting_settings.relight_path
+                );
+                if let Err(err) = record_light_agnostic_paths(
+                    &relighting_settings.relight_path,
+                    width,
+                    height,
+                    &relighting_settings,
+                    &render_backend,
+                    camera.as_ref(),
+                    &world.objects,
+                    dir_lights.as_ref(),
+                    camera.clone(),
+                    world_bvh.clone(),
+                ) {
+                    panic!("Failed to record NRP training paths: {err}");
+                }
+            }
+
+            eprintln!(
+                "NRP 2/3: exporting first-hit auxiliary features -> {}",
+                relighting_settings.nrp_aux_file
+            );
+            if let Err(err) = write_nrp_aux_features(
+                &relighting_settings.nrp_aux_file,
+                width,
+                height,
+                camera.as_ref(),
+                &world.objects,
+                dir_lights.as_ref(),
+            ) {
+                panic!("Failed to export NRP auxiliary features: {err}");
+            }
+
+            eprintln!("NRP 2/3: training scene proxy -> {}", nrp_weights.display());
+            if let Err(err) = train_nrp_weights(
+                &relighting_settings,
+                width,
+                height,
+                output_dir,
+                &virtual_lights,
+            ) {
+                panic!("Failed to train NRP weights: {err}");
+            }
+        } else {
+            eprintln!(
+                "NRP 1/3: using existing weights at {}",
+                nrp_weights.display()
+            );
+        }
+
+        eprintln!(
+            "NRP 3/3: running neural relighting -> {}",
+            relighting_settings.relight_output
+        );
+        let export_jsonl = if relighting_settings.record_paths {
+            Some(PathBuf::from(&relighting_settings.relight_path))
+        } else {
+            None
+        };
+        if let Err(err) = crate::relight_pipeline::RelightPipeline::render_nrp_relighting(
             width,
             height,
-            relight_spp,
+            relighting_settings.path_spp as u32,
+            relighting_settings.path_depth,
+            camera.as_ref(),
+            &world.objects,
+            dir_lights.as_ref(),
+            export_jsonl.as_deref(),
+            nrp_weights.as_path(),
+            PathBuf::from(&relighting_settings.relight_output).as_path(),
             &virtual_lights,
         ) {
-            eprintln!("Failed to gather relighting pass: {err}");
+            panic!("NRP relighting failed: {err}");
+        }
+
+        if let Some(reference_output) = &relighting_settings.reference_output {
+            if let Err(err) = relighting::gather_light_from_paths(
+                &relighting_settings.relight_path,
+                reference_output,
+                width,
+                height,
+                relighting_settings.relight_spp,
+                &virtual_lights,
+            ) {
+                eprintln!("Failed to gather exact relighting reference: {err}");
+            }
         }
 
         if let Err(err) = write_relighting_metadata(
-            &relight_metadata,
+            &relighting_settings.metadata_output,
             width,
             height,
-            relight_spp,
-            &relight_path,
-            &relight_output,
+            relighting_settings.relight_spp,
+            &relighting_settings.relight_path,
+            &relighting_settings.relight_output,
             &virtual_lights,
+            &relighting_settings.pipeline,
         ) {
             eprintln!("Failed to write relighting metadata: {err}");
+        }
+
+        if relighting_settings.open_editor_after_render {
+            eprintln!("Opening relighting editor with NRP weights...");
+            if let Err(err) = crate::relight_editor::run(
+                camera.clone(),
+                Arc::new(world.objects.clone()),
+                dir_lights.clone(),
+                virtual_lights.clone(),
+                crate::relight_editor::RelightEditorSettings {
+                    width: relight_editor_width,
+                    height: relight_editor_height,
+                    path_spp: relighting_settings.path_spp as u32,
+                    path_depth: relighting_settings.path_depth,
+                    export_jsonl: None,
+                    nrp_weights: Some(nrp_weights),
+                    start_nrp: relight_editor_start_nrp,
+                    output_dir: PathBuf::from(output_dir),
+                },
+            ) {
+                panic!("Relight editor failed: {err}");
+            }
         }
     }
 }
@@ -790,6 +875,348 @@ impl DatasetSettings {
                 .unwrap_or_else(|| output_path(output_dir, "kpcn_metadata.json")),
         }
     }
+}
+
+struct RelightingSettings {
+    gather: bool,
+    relight_only: bool,
+    record_paths: bool,
+    auto_train_nrp: bool,
+    retrain_nrp: bool,
+    open_editor_after_render: bool,
+    path_spp: u16,
+    path_depth: u32,
+    relight_spp: u16,
+    path_output: String,
+    relight_path: String,
+    relight_output: String,
+    metadata_output: String,
+    reference_output: Option<String>,
+    nrp_weights: String,
+    nrp_lights_file: String,
+    nrp_aux_file: String,
+    nrp_trainer_script: String,
+    nrp_python: String,
+    nrp_train_epochs: u32,
+    nrp_train_max_records: u32,
+    nrp_train_batch_size: u32,
+    nrp_train_hidden_dim: u32,
+    nrp_train_layers: u32,
+    nrp_train_lr: f64,
+    nrp_hash_levels: u32,
+    nrp_hash_features: u32,
+    nrp_hash_table_size: u32,
+    nrp_random_lights: u32,
+    nrp_lights_per_pixel: u32,
+    nrp_max_training_samples: u32,
+    nrp_target_denoise_radius: u32,
+    nrp_target_denoise_passes: u32,
+    pipeline: String,
+}
+
+impl RelightingSettings {
+    fn from_json(settings: &serde_json::Value, output_dir: &str, default_depth: u32) -> Self {
+        let relight_only = setting_bool(settings, "relight_only", false);
+        let gather = setting_bool(settings, "gather_relighting", false)
+            || setting_bool(settings, "nrp_relighting", false)
+            || relight_only;
+        let path_spp = setting_u16(settings, "path_spp", 1).max(1);
+        let path_depth = setting_u32(settings, "path_depth", default_depth).max(1);
+        let relight_spp = setting_u16(
+            settings,
+            "relight_path_spp",
+            setting_u16(settings, "path_spp", 1),
+        )
+        .max(1);
+        let path_output = setting_string(settings, "path_output_file")
+            .unwrap_or_else(|| output_path(output_dir, "krust_paths.jsonl"));
+        let relight_path =
+            setting_string(settings, "relight_path_file").unwrap_or_else(|| path_output.clone());
+
+        Self {
+            gather,
+            relight_only,
+            record_paths: setting_bool(settings, "record_paths", gather),
+            auto_train_nrp: setting_bool(settings, "auto_train_nrp", gather),
+            retrain_nrp: setting_bool(settings, "retrain_nrp", false),
+            open_editor_after_render: setting_bool(
+                settings,
+                "open_relight_editor_after_render",
+                false,
+            ) || setting_bool(settings, "open_relight_editor", false),
+            path_spp,
+            path_depth,
+            relight_spp,
+            path_output,
+            relight_path,
+            relight_output: setting_string(settings, "relight_output_file")
+                .unwrap_or_else(|| output_path(output_dir, "krust_nrp_relight.exr")),
+            metadata_output: setting_string(settings, "relight_metadata_file")
+                .unwrap_or_else(|| output_path(output_dir, "krust_nrp_relight.json")),
+            reference_output: setting_string(settings, "reference_relight_output_file")
+                .or_else(|| setting_string(settings, "exact_relight_output_file")),
+            nrp_weights: setting_string(settings, "nrp_weights_file")
+                .unwrap_or_else(|| output_path(output_dir, "scene_proxy.bin")),
+            nrp_lights_file: setting_string(settings, "nrp_lights_file")
+                .unwrap_or_else(|| output_path(output_dir, "nrp_training_lights.json")),
+            nrp_aux_file: setting_string(settings, "nrp_aux_file")
+                .unwrap_or_else(|| output_path(output_dir, "nrp_aux_features.json")),
+            nrp_trainer_script: setting_string(settings, "nrp_trainer_script")
+                .unwrap_or_else(|| "scripts/train_scene_proxy.py".to_string()),
+            nrp_python: setting_string(settings, "nrp_python")
+                .or_else(|| setting_string(settings, "python"))
+                .unwrap_or_else(|| "python3".to_string()),
+            nrp_train_epochs: setting_u32(settings, "nrp_train_epochs", 20).max(1),
+            nrp_train_max_records: setting_u32(settings, "nrp_train_max_records", 200_000).max(1),
+            nrp_train_batch_size: setting_u32(settings, "nrp_train_batch_size", 4096).max(1),
+            nrp_train_hidden_dim: setting_u32(settings, "nrp_train_hidden_dim", 256).max(1),
+            nrp_train_layers: setting_u32(settings, "nrp_train_layers", 8).max(2),
+            nrp_train_lr: setting_f64(settings, "nrp_train_lr", 1e-3),
+            nrp_hash_levels: setting_u32(settings, "nrp_hash_levels", 16).clamp(1, 16),
+            nrp_hash_features: setting_u32(settings, "nrp_hash_features", 2).clamp(1, 2),
+            nrp_hash_table_size: setting_u32(settings, "nrp_hash_table_size", 131_072).max(1),
+            nrp_random_lights: setting_u32(settings, "nrp_random_lights", 16),
+            nrp_lights_per_pixel: setting_u32(settings, "nrp_lights_per_pixel", 2).max(1),
+            nrp_max_training_samples: setting_u32(settings, "nrp_max_training_samples", 300_000)
+                .max(1),
+            nrp_target_denoise_radius: setting_u32(settings, "nrp_target_denoise_radius", 3),
+            nrp_target_denoise_passes: setting_u32(settings, "nrp_target_denoise_passes", 2),
+            pipeline: "nrp".to_string(),
+        }
+    }
+}
+
+fn record_light_agnostic_paths(
+    path: &str,
+    width: u32,
+    height: u32,
+    settings: &RelightingSettings,
+    render_backend: &str,
+    camera: &Camera,
+    objects: &[Arc<Object>],
+    directional_lights: &[DirectionalLight],
+    cpu_camera: Arc<Camera>,
+    world_bvh: Arc<Object>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = PathBuf::from(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let gpu_record_paths =
+        render_backend == "gpu" || render_backend == "gpu_aov" || render_backend == "webgpu";
+    if gpu_record_paths {
+        let count = gpu::record_scene_paths(
+            path,
+            width,
+            height,
+            settings.path_spp,
+            settings.path_depth,
+            camera,
+            objects,
+            directional_lights,
+        )?;
+        eprintln!("Recorded {count} light-agnostic GPU path vertices.");
+        return Ok(());
+    }
+
+    path_recording::record_scene_paths(
+        path,
+        width,
+        height,
+        settings.path_spp,
+        settings.path_depth,
+        cpu_camera,
+        world_bvh,
+    )?;
+    Ok(())
+}
+
+fn train_nrp_weights(
+    settings: &RelightingSettings,
+    width: u32,
+    height: u32,
+    output_dir: &str,
+    lights: &[VirtualLight],
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_virtual_lights_file(&settings.nrp_lights_file, lights)?;
+    if let Some(parent) = PathBuf::from(&settings.nrp_weights).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    eprintln!(
+        "NRP train: {} --epochs {} --max-records {}",
+        settings.nrp_trainer_script, settings.nrp_train_epochs, settings.nrp_train_max_records
+    );
+
+    let status = Command::new(&settings.nrp_python)
+        .arg(&settings.nrp_trainer_script)
+        .arg("--paths")
+        .arg(&settings.relight_path)
+        .arg("--virtual-lights-file")
+        .arg(&settings.nrp_lights_file)
+        .arg("--output")
+        .arg(&settings.nrp_weights)
+        .arg("--aux")
+        .arg(&settings.nrp_aux_file)
+        .arg("--width")
+        .arg(width.to_string())
+        .arg("--height")
+        .arg(height.to_string())
+        .arg("--epochs")
+        .arg(settings.nrp_train_epochs.to_string())
+        .arg("--max-records")
+        .arg(settings.nrp_train_max_records.to_string())
+        .arg("--batch-size")
+        .arg(settings.nrp_train_batch_size.to_string())
+        .arg("--hidden-dim")
+        .arg(settings.nrp_train_hidden_dim.to_string())
+        .arg("--num-layers")
+        .arg(settings.nrp_train_layers.to_string())
+        .arg("--lr")
+        .arg(settings.nrp_train_lr.to_string())
+        .arg("--hash-levels")
+        .arg(settings.nrp_hash_levels.to_string())
+        .arg("--hash-features")
+        .arg(settings.nrp_hash_features.to_string())
+        .arg("--hash-table-size")
+        .arg(settings.nrp_hash_table_size.to_string())
+        .arg("--random-lights")
+        .arg(settings.nrp_random_lights.to_string())
+        .arg("--lights-per-pixel")
+        .arg(settings.nrp_lights_per_pixel.to_string())
+        .arg("--max-training-samples")
+        .arg(settings.nrp_max_training_samples.to_string())
+        .arg("--target-denoise-radius")
+        .arg(settings.nrp_target_denoise_radius.to_string())
+        .arg("--target-denoise-passes")
+        .arg(settings.nrp_target_denoise_passes.to_string())
+        .current_dir(std::env::current_dir().unwrap_or_else(|_| PathBuf::from(output_dir)))
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()?;
+
+    if !status.success() {
+        return Err(format!("trainer exited with status {status}").into());
+    }
+    if !PathBuf::from(&settings.nrp_weights).exists() {
+        return Err(format!("trainer did not write {}", settings.nrp_weights).into());
+    }
+
+    Ok(())
+}
+
+fn write_nrp_aux_features(
+    path: &str,
+    width: u32,
+    height: u32,
+    camera: &Camera,
+    objects: &[Arc<Object>],
+    directional_lights: &[DirectionalLight],
+) -> Result<(), Box<dyn std::error::Error>> {
+    if let Some(parent) = PathBuf::from(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let buffers = gpu::render_first_hit_aovs(width, height, camera, objects, directional_lights)?;
+    let mut features = Vec::with_capacity((width * height * 10) as usize);
+    for y in 0..height {
+        for x in 0..width {
+            let pixel = buffers.get_pixel(x, y);
+            features.push(pixel.albedo.r);
+            features.push(pixel.albedo.g);
+            features.push(pixel.albedo.b);
+            features.push(pixel.depth.r.max(0.0).ln_1p());
+            features.push(pixel.normal.r);
+            features.push(pixel.normal.g);
+            features.push(pixel.normal.b);
+            features.push(pixel.position.r);
+            features.push(pixel.position.g);
+            features.push(pixel.position.b);
+        }
+    }
+
+    let payload = serde_json::json!({
+        "width": width,
+        "height": height,
+        "feature_count": 10,
+        "features": features,
+    });
+    let payload = serde_json::to_string(&payload)?;
+    fs::write(path, format!("{payload}\n"))?;
+    Ok(())
+}
+
+fn nrp_weights_need_training(settings: &RelightingSettings) -> bool {
+    let path = PathBuf::from(&settings.nrp_weights);
+    if !path.exists() {
+        return true;
+    }
+
+    let Ok(bytes) = fs::read(path) else {
+        return true;
+    };
+    if bytes.len() < 8 * std::mem::size_of::<f32>() {
+        return true;
+    }
+
+    let read_u32 = |index: usize| -> u32 {
+        let start = index * std::mem::size_of::<f32>();
+        let mut raw = [0u8; 4];
+        raw.copy_from_slice(&bytes[start..start + 4]);
+        f32::from_le_bytes(raw).round().max(0.0) as u32
+    };
+
+    let expected_input_dim = settings.nrp_hash_levels * settings.nrp_hash_features + 10 + 10;
+    if read_u32(0) != expected_input_dim
+        || read_u32(4) != settings.nrp_hash_table_size
+        || read_u32(5) != settings.nrp_hash_levels
+        || read_u32(6) != settings.nrp_hash_features
+    {
+        return true;
+    }
+
+    let meta_path = PathBuf::from(&settings.nrp_weights).with_extension("json");
+    let Ok(meta) = fs::read_to_string(meta_path) else {
+        return true;
+    };
+    let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta) else {
+        return true;
+    };
+
+    meta["target_model"].as_str() != Some("direct_feature_v4")
+        || meta["hash_interpolation"].as_str() != Some("bilinear")
+}
+
+fn write_virtual_lights_file(path: &str, lights: &[VirtualLight]) -> std::io::Result<()> {
+    if let Some(parent) = PathBuf::from(path).parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+
+    let lights = lights
+        .iter()
+        .map(|light| {
+            serde_json::json!({
+                "position": [light.position.x, light.position.y, light.position.z],
+                "color": [light.color.r, light.color.g, light.color.b],
+                "intensity": light.intensity,
+                "radius": light.radius,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let payload = serde_json::json!({ "virtual_lights": lights });
+    let payload = serde_json::to_string_pretty(&payload)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+    fs::write(path, format!("{payload}\n"))
 }
 
 fn should_export_exr(settings: &serde_json::Value, output: &str) -> bool {
@@ -832,6 +1259,10 @@ fn setting_u32(settings: &serde_json::Value, key: &str, default: u32) -> u32 {
         .as_u64()
         .map(|value| value as u32)
         .unwrap_or(default)
+}
+
+fn setting_f64(settings: &serde_json::Value, key: &str, default: f64) -> f64 {
+    settings[key].as_f64().unwrap_or(default)
 }
 
 fn output_path(output_dir: &str, file_name: &str) -> String {
@@ -926,6 +1357,7 @@ fn write_relighting_metadata(
     path_file: &str,
     output_file: &str,
     lights: &[VirtualLight],
+    pipeline: &str,
 ) -> std::io::Result<()> {
     if let Some(parent) = PathBuf::from(path).parent() {
         if !parent.as_os_str().is_empty() {
@@ -946,6 +1378,7 @@ fn write_relighting_metadata(
 
     let metadata = serde_json::json!({
         "mode": "relighting",
+        "pipeline": pipeline,
         "width": width,
         "height": height,
         "samples_per_pixel": samples_per_pixel,

@@ -1,4 +1,5 @@
 //! Compact fp16 position + rgb9e5 throughput packing for GPU path vertices.
+#![allow(dead_code)]
 
 use crate::gpu::GpuPathVertex;
 
@@ -46,12 +47,12 @@ pub fn unpack_rgb9e5(packed: u32) -> (f32, f32, f32) {
 
 pub fn pack_path_vertex(vertex: &GpuPathVertex) -> GpuPackedPathVertex {
     let mut words = [0u32; 8];
-    words[0] = (f32_to_f16(vertex.position[0]) as u32)
-        | ((f32_to_f16(vertex.position[1]) as u32) << 16);
-    words[1] = (f32_to_f16(vertex.position[2]) as u32)
-        | ((f32_to_f16(vertex.outgoing[0]) as u32) << 16);
-    words[2] = (f32_to_f16(vertex.outgoing[1]) as u32)
-        | ((f32_to_f16(vertex.outgoing[2]) as u32) << 16);
+    words[0] =
+        (f32_to_f16(vertex.position[0]) as u32) | ((f32_to_f16(vertex.position[1]) as u32) << 16);
+    words[1] =
+        (f32_to_f16(vertex.position[2]) as u32) | ((f32_to_f16(vertex.outgoing[0]) as u32) << 16);
+    words[2] =
+        (f32_to_f16(vertex.outgoing[1]) as u32) | ((f32_to_f16(vertex.outgoing[2]) as u32) << 16);
     words[3] = pack_rgb9e5(
         vertex.throughput[0],
         vertex.throughput[1],

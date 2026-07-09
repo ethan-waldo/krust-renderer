@@ -22,6 +22,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True, help="NRP .bin weights")
     parser.add_argument("--checkpoint-meta", help="Optional .json metadata")
     parser.add_argument("--paths", required=True, help="Path JSONL (for pixel list)")
+    parser.add_argument("--aux", help="Optional NRP auxiliary feature JSON")
     parser.add_argument("--output", required=True, help="Output optimized lights JSON")
     parser.add_argument("--target-image", help="Target EXR/PNG for image loss")
     parser.add_argument("--target-color", nargs=3, type=float, help="Mean RGB target")
@@ -52,8 +53,12 @@ def load_weights(path: Path) -> tuple[dict, list[float]]:
         "hidden_dim": int(values[1]),
         "output_dim": int(values[2]),
         "num_layers": int(values[3]),
+        "hash_table_size": int(values[4]),
+        "hash_levels": int(values[5]),
+        "hash_features": int(values[6]),
+        "hash_offset": int(values[7]),
     }
-    return header, list(values[8:])
+    return header, list(values)
 
 
 def build_mlp(header: dict, weights: list[float]) -> "torch.nn.Module":
@@ -63,7 +68,7 @@ def build_mlp(header: dict, weights: list[float]) -> "torch.nn.Module":
     input_dim = header["input_dim"]
     hidden_dim = header["hidden_dim"]
     num_layers = header["num_layers"]
-    offset = 0
+    offset = 8
 
     def take(shape: tuple[int, ...]) -> torch.Tensor:
         nonlocal offset
@@ -87,16 +92,85 @@ def build_mlp(header: dict, weights: list[float]) -> "torch.nn.Module":
     out = nn.Linear(hidden_dim, 3)
     out.weight.data = take((3, hidden_dim))
     out.bias.data = take((3,))
-    layers.extend([out, nn.Softplus()])
+    layers.append(out)
     return nn.Sequential(*layers)
 
 
-def hash_grid(px: float, py: float, level: int) -> np.ndarray:
-    scale = 2**level
-    fx = px * scale
-    fy = py * scale
-    h = np.sin(np.array([fx * 12.9898, fy * 78.233])) * 43758.5453
-    return np.mod(h, 1.0)
+def build_hash_table(header: dict, weights: list[float]) -> "torch.nn.Embedding":
+    import torch
+    from torch import nn
+
+    table_size = header["hash_table_size"]
+    levels = header["hash_levels"]
+    features = header["hash_features"]
+    offset = header["hash_offset"]
+    values = torch.tensor(
+        weights[offset : offset + table_size * levels * features],
+        dtype=torch.float32,
+    ).reshape(levels * table_size, features)
+    table = nn.Embedding(levels * table_size, features)
+    table.weight.data = values
+    table.weight.requires_grad_(False)
+    return table
+
+
+def hash_resolution(level: int) -> int:
+    return max(1, int(math.floor(16.0 * (1.3**level))))
+
+
+def hash_cell(ix: int, iy: int, level: int, table_size: int) -> int:
+    hashed = ((ix * 73_856_093) ^ (iy * 19_349_663) ^ (level * 83_492_791)) & 0xFFFFFFFF
+    return int(hashed % table_size)
+
+
+def hash_corners(px: int, py: int, width: int, height: int, level: int, table_size: int) -> tuple[list[int], list[float]]:
+    u = px / max(width - 1, 1)
+    v = py / max(height - 1, 1)
+    res = hash_resolution(level)
+    fx = u * max(res - 1, 1)
+    fy = v * max(res - 1, 1)
+    ix0 = min(int(math.floor(fx)), res - 1)
+    iy0 = min(int(math.floor(fy)), res - 1)
+    ix1 = min(ix0 + 1, res - 1)
+    iy1 = min(iy0 + 1, res - 1)
+    tx = fx - ix0
+    ty = fy - iy0
+    return (
+        [
+            hash_cell(ix0, iy0, level, table_size),
+            hash_cell(ix1, iy0, level, table_size),
+            hash_cell(ix0, iy1, level, table_size),
+            hash_cell(ix1, iy1, level, table_size),
+        ],
+        [
+            (1.0 - tx) * (1.0 - ty),
+            tx * (1.0 - ty),
+            (1.0 - tx) * ty,
+            tx * ty,
+        ],
+    )
+
+
+def pixel_hash_encoding(
+    px: int,
+    py: int,
+    width: int,
+    height: int,
+    header: dict,
+    hash_table: "torch.nn.Embedding",
+) -> "torch.Tensor":
+    import torch
+
+    indices = []
+    weights = []
+    for level in range(header["hash_levels"]):
+        corners, corner_weights = hash_corners(px, py, width, height, level, header["hash_table_size"])
+        indices.extend([level * header["hash_table_size"] + corner for corner in corners])
+        weights.extend(corner_weights)
+    index_tensor = torch.tensor(indices, dtype=torch.long)
+    weight_tensor = torch.tensor(weights, dtype=torch.float32).reshape(header["hash_levels"], 4, 1)
+    encoded = hash_table(index_tensor).reshape(header["hash_levels"], 4, header["hash_features"])
+    return (encoded * weight_tensor).sum(dim=1).flatten()
 
 
 def load_target(args: argparse.Namespace, width: int, height: int) -> np.ndarray:
@@ -114,6 +188,31 @@ def load_target(args: argparse.Namespace, width: int, height: int) -> np.ndarray
     return np.array([0.6, 0.45, 0.35], dtype=np.float32)
 
 
+def load_aux(path: str | None, width: int, height: int) -> np.ndarray | None:
+    if not path or not Path(path).exists():
+        return None
+    aux_data = json.loads(Path(path).read_text(encoding="utf-8"))
+    feature_count = int(aux_data.get("feature_count", 4))
+    aux = np.array(aux_data["features"], dtype=np.float32).reshape(
+        int(aux_data.get("height", height)),
+        int(aux_data.get("width", width)),
+        feature_count,
+    )
+    if feature_count < 10:
+        padded = np.zeros((aux.shape[0], aux.shape[1], 10), dtype=np.float32)
+        padded[:, :, :feature_count] = aux
+        aux = padded
+    return aux
+
+
+def aux_features(px: int, py: int, aux: np.ndarray | None) -> "torch.Tensor":
+    import torch
+
+    if aux is None or py >= aux.shape[0] or px >= aux.shape[1]:
+        return torch.zeros(10, dtype=torch.float32)
+    return torch.tensor(aux[py, px, :10], dtype=torch.float32)
+
+
 def main() -> None:
     args = parse_args()
     random.seed(args.seed)
@@ -125,6 +224,7 @@ def main() -> None:
 
     header, weights = load_weights(Path(args.checkpoint))
     model = build_mlp(header, weights)
+    hash_table = build_hash_table(header, weights)
     model.eval()
 
     width, height = args.width, args.height
@@ -134,6 +234,7 @@ def main() -> None:
         height = int(meta.get("height", height))
 
     target = load_target(args, width, height)
+    aux = load_aux(args.aux, width, height)
     scribble_mask = None
     if args.scribble:
         scribble_mask = json.loads(Path(args.scribble).read_text(encoding="utf-8"))
@@ -160,33 +261,29 @@ def main() -> None:
         for px, py in batch:
             u = px / max(width - 1, 1)
             v = py / max(height - 1, 1)
-            h = hash_grid(u, v, 0)
-            features = torch.tensor(
+            hash_features = pixel_hash_encoding(px, py, width, height, header, hash_table)
+            light_features = torch.stack(
                 [
-                    u,
-                    v,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0.0,
-                    float(position[0]),
-                    float(position[1]),
-                    float(position[2]),
-                    float(radius),
-                    float(color[0]),
-                    float(color[1]),
-                    float(color[2]),
-                    float(log_intensity),
-                    float(h[0]),
-                    float(h[1]),
-                    float(h[2]),
-                ],
-                dtype=torch.float32,
+                    torch.tensor(u, dtype=torch.float32),
+                    torch.tensor(v, dtype=torch.float32),
+                    position[0],
+                    position[1],
+                    position[2],
+                    radius,
+                    color[0],
+                    color[1],
+                    color[2],
+                    log_intensity,
+                ]
             )
-            pred = model(features)
+            features = torch.cat(
+                [
+                    hash_features,
+                    light_features,
+                    aux_features(px, py, aux),
+                ]
+            )
+            pred = torch.expm1(model(features)).clamp_min(0.0)
             if isinstance(target, np.ndarray) and target.ndim == 3:
                 tgt = torch.tensor(target[py, px], dtype=torch.float32)
             else:

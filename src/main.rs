@@ -14,9 +14,9 @@ mod path_packing;
 mod path_recording;
 mod pdf;
 mod ray;
-mod relighting;
 mod relight_editor;
 mod relight_pipeline;
+mod relighting;
 mod render;
 mod render_setup;
 mod sphere;
@@ -58,6 +58,11 @@ fn preview_window_requested(scene_file: &str) -> bool {
             return false;
         }
     }
+    if setting_bool(&json["settings"], "open_relight_editor_after_render", false)
+        || setting_bool(&json["settings"], "open_relight_editor", false)
+    {
+        return false;
+    }
 
     match &json["settings"]["preview_window"] {
         serde_json::Value::Bool(value) => *value,
@@ -65,4 +70,20 @@ fn preview_window_requested(scene_file: &str) -> bool {
         serde_json::Value::String(value) => value == "true" || value == "1",
         _ => true,
     }
+}
+
+fn setting_bool(settings: &serde_json::Value, key: &str, default: bool) -> bool {
+    if let Some(value) = settings[key].as_bool() {
+        return value;
+    }
+
+    if let Some(value) = settings[key].as_u64() {
+        return value != 0;
+    }
+
+    if let Some(value) = settings[key].as_str() {
+        return value == "true" || value == "1";
+    }
+
+    default
 }

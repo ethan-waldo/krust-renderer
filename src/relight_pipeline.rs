@@ -3,6 +3,7 @@
 use crate::buffers::FrameBuffers;
 use crate::camera::Camera;
 use crate::color::Color;
+use crate::exr_export;
 use crate::gpu::{self, GpuPathCache};
 use crate::hit::Object;
 use crate::lights::DirectionalLight;
@@ -44,6 +45,7 @@ impl EditorLight {
         }
     }
 
+    #[allow(dead_code)]
     pub fn quad(position: Vec3, u_axis: Vec3, v_axis: Vec3, color: Color, intensity: f64) -> Self {
         Self {
             light_type: EditorLightType::Quad,
@@ -57,7 +59,7 @@ impl EditorLight {
     }
 
     pub fn from_virtual(light: &VirtualLight) -> Self {
-        Self::sphere(light.position, light.color, light.intensity, 0.5)
+        Self::sphere(light.position, light.color, light.intensity, light.radius)
     }
 }
 
@@ -120,6 +122,8 @@ pub struct RelightPipeline {
     aux_view: wgpu::TextureView,
     _normal_texture: wgpu::Texture,
     normal_view: wgpu::TextureView,
+    _position_texture: wgpu::Texture,
+    position_view: wgpu::TextureView,
     ldr_texture: wgpu::Texture,
     ldr_view: wgpu::TextureView,
     gather_pipeline: wgpu::ComputePipeline,
@@ -134,6 +138,38 @@ pub struct RelightPipeline {
 }
 
 impl RelightPipeline {
+    pub fn render_nrp_relighting(
+        width: u32,
+        height: u32,
+        samples_per_pixel: u32,
+        max_depth: u32,
+        camera: &Camera,
+        objects: &[Arc<Object>],
+        directional_lights: &[DirectionalLight],
+        export_jsonl: Option<&Path>,
+        weights_path: &Path,
+        output_path: &Path,
+        lights: &[VirtualLight],
+    ) -> Result<(), Box<dyn Error>> {
+        let mut pipeline = Self::build(
+            width,
+            height,
+            samples_per_pixel,
+            max_depth,
+            camera,
+            objects,
+            directional_lights,
+            export_jsonl,
+        )?;
+        pipeline.load_nrp_weights(weights_path)?;
+        let editor_lights = lights
+            .iter()
+            .map(EditorLight::from_virtual)
+            .collect::<Vec<_>>();
+        pipeline.gather_and_tonemap(&editor_lights, true);
+        pipeline.save_ldr_image(output_path)
+    }
+
     pub fn build(
         width: u32,
         height: u32,
@@ -166,13 +202,8 @@ impl RelightPipeline {
             eprintln!("Recorded {written} path vertices to {}", path.display());
         }
 
-        let aux_buffers = gpu::render_first_hit_aovs(
-            width,
-            height,
-            camera,
-            objects,
-            directional_lights,
-        )?;
+        let aux_buffers =
+            gpu::render_first_hit_aovs(width, height, camera, objects, directional_lights)?;
 
         block_on(Self::build_async(
             path_cache,
@@ -203,7 +234,7 @@ impl RelightPipeline {
             path_count,
         } = path_cache;
 
-        let (aux_texture, aux_view, normal_texture, normal_view) =
+        let (aux_texture, aux_view, normal_texture, normal_view, position_texture, position_view) =
             upload_aux_textures(&device, &queue, width, height, aux_buffers)?;
         let ldr_texture = create_rgba8_texture(&device, width, height, "krust ldr");
         let ldr_view = ldr_texture.create_view(&Default::default());
@@ -282,6 +313,8 @@ impl RelightPipeline {
             aux_view,
             _normal_texture: normal_texture,
             normal_view,
+            _position_texture: position_texture,
+            position_view,
             ldr_texture,
             ldr_view,
             gather_pipeline,
@@ -298,46 +331,47 @@ impl RelightPipeline {
 
     pub fn load_nrp_weights(&mut self, path: &Path) -> Result<(), Box<dyn Error>> {
         let weights = std::fs::read(path)?;
-        let nrp_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("krust nrp"),
-            source: wgpu::ShaderSource::Wgsl(NRP_INFERENCE_SHADER.into()),
-        });
-        let nrp_bind_layout = self
+        let nrp_shader = self
             .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("krust nrp layout"),
-                entries: &[
-                    uniform_entry(0),
-                    storage_entry(1, true),
-                    storage_entry(2, true),
-                    texture_entry_non_filterable(3),
-                    texture_entry_non_filterable(4),
-                    storage_texture_rgba8_entry(5),
-                ],
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("krust nrp"),
+                source: wgpu::ShaderSource::Wgsl(NRP_INFERENCE_SHADER.into()),
             });
+        let nrp_bind_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("krust nrp layout"),
+                    entries: &[
+                        uniform_entry(0),
+                        storage_entry(1, true),
+                        storage_entry(2, true),
+                        texture_entry_non_filterable(3),
+                        texture_entry_non_filterable(4),
+                        texture_entry_non_filterable(5),
+                        storage_texture_rgba8_entry(6),
+                    ],
+                });
         let nrp_pipeline = self
             .device
             .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
                 label: Some("krust nrp pipeline"),
-                layout: Some(
-                    &self.device.create_pipeline_layout(
-                        &wgpu::PipelineLayoutDescriptor {
-                            label: Some("krust nrp pl"),
-                            bind_group_layouts: &[&nrp_bind_layout],
-                            push_constant_ranges: &[],
-                        },
-                    ),
-                ),
+                layout: Some(&self.device.create_pipeline_layout(
+                    &wgpu::PipelineLayoutDescriptor {
+                        label: Some("krust nrp pl"),
+                        bind_group_layouts: &[&nrp_bind_layout],
+                        push_constant_ranges: &[],
+                    },
+                )),
                 module: &nrp_shader,
                 entry_point: "main",
             });
-        let nrp_weights = self.device.create_buffer_init(
-            &wgpu::util::BufferInitDescriptor {
+        let nrp_weights = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("krust nrp weights"),
                 contents: &weights,
                 usage: wgpu::BufferUsages::STORAGE,
-            },
-        );
+            });
         self.nrp_pipeline = Some(nrp_pipeline);
         self.nrp_bind_layout = Some(nrp_bind_layout);
         self.nrp_weights = Some(nrp_weights);
@@ -347,17 +381,19 @@ impl RelightPipeline {
     pub fn gather_and_tonemap(&self, lights: &[EditorLight], use_nrp: bool) {
         let gpu_lights: Vec<GpuEditorLight> = lights.iter().map(to_gpu_light).collect();
         let light_buffer = if gpu_lights.is_empty() {
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("krust empty lights"),
-                contents: &[0u8; size_of::<GpuEditorLight>()],
-                usage: wgpu::BufferUsages::STORAGE,
-            })
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("krust empty lights"),
+                    contents: &[0u8; size_of::<GpuEditorLight>()],
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
         } else {
-            self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("krust editor lights"),
-                contents: bytemuck::cast_slice(&gpu_lights),
-                usage: wgpu::BufferUsages::STORAGE,
-            })
+            self.device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("krust editor lights"),
+                    contents: bytemuck::cast_slice(&gpu_lights),
+                    usage: wgpu::BufferUsages::STORAGE,
+                })
         };
 
         let gather_params = GatherParams {
@@ -424,11 +460,9 @@ impl RelightPipeline {
             });
 
         if use_nrp {
-            if let (Some(pipeline), Some(layout), Some(weights)) = (
-                &self.nrp_pipeline,
-                &self.nrp_bind_layout,
-                &self.nrp_weights,
-            ) {
+            if let (Some(pipeline), Some(layout), Some(weights)) =
+                (&self.nrp_pipeline, &self.nrp_bind_layout, &self.nrp_weights)
+            {
                 let nrp_params = gather_params;
                 let nrp_params_buffer =
                     self.device
@@ -463,6 +497,10 @@ impl RelightPipeline {
                         },
                         wgpu::BindGroupEntry {
                             binding: 5,
+                            resource: wgpu::BindingResource::TextureView(&self.position_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 6,
                             resource: wgpu::BindingResource::TextureView(&self.ldr_view),
                         },
                     ],
@@ -490,16 +528,55 @@ impl RelightPipeline {
         self.queue.submit(Some(encoder.finish()));
     }
 
-    pub fn ldr_view(&self) -> &wgpu::TextureView {
-        &self.ldr_view
+    pub fn save_ldr_image(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        if path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| extension.eq_ignore_ascii_case("exr"))
+            .unwrap_or(false)
+        {
+            self.save_ldr_exr(path)
+        } else {
+            self.save_ldr_png(path)
+        }
     }
 
-    pub fn ldr_texture(&self) -> &wgpu::Texture {
-        &self.ldr_texture
-    }
-
-    /// Read the LDR gather result back to the CPU and save as PNG (diagnostic).
+    /// Read the LDR relight result back to the CPU and save as PNG.
     pub fn save_ldr_png(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let pixels = self.read_ldr_pixels()?;
+        let img: image::RgbaImage = image::ImageBuffer::from_raw(self.width, self.height, pixels)
+            .ok_or("bad image buffer")?;
+        img.save(path)?;
+        Ok(())
+    }
+
+    /// Read the LDR relight result back to the CPU and save it through the existing EXR exporter.
+    pub fn save_ldr_exr(&self, path: &Path) -> Result<(), Box<dyn Error>> {
+        let pixels = self.read_ldr_pixels()?;
+        let rgba: image::Rgba32FImage = image::ImageBuffer::new(self.width, self.height);
+        let diffuse: image::Rgba32FImage = image::ImageBuffer::new(self.width, self.height);
+        let specular: image::Rgba32FImage = image::ImageBuffer::new(self.width, self.height);
+        let mut buffers = FrameBuffers::new(rgba, diffuse, specular);
+
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let offset = ((y * self.width + x) * 4) as usize;
+                let color = Color::new(
+                    pixels[offset] as f64 / 255.0,
+                    pixels[offset + 1] as f64 / 255.0,
+                    pixels[offset + 2] as f64 / 255.0,
+                    pixels[offset + 3] as f64 / 255.0,
+                );
+                let mut lobes = buffers.get_pixel(x, y);
+                lobes.rgba = color;
+                buffers.put_pixel(x, y, lobes);
+            }
+        }
+
+        exr_export::write_framebuffers(path, &buffers)
+    }
+
+    fn read_ldr_pixels(&self) -> Result<Vec<u8>, Box<dyn Error>> {
         let width = self.width;
         let height = self.height;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -555,24 +632,11 @@ impl RelightPipeline {
         }
         drop(mapped);
         staging.unmap();
-        let img: image::RgbaImage =
-            image::ImageBuffer::from_raw(width, height, pixels).ok_or("bad image buffer")?;
-        img.save(path)?;
-        Ok(())
+        Ok(pixels)
     }
-
-    pub fn ldr_texture_needs_copy_src(&self) {}
 
     pub fn nrp_available(&self) -> bool {
         self.nrp_pipeline.is_some()
-    }
-
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.height
     }
 
     pub fn create_surface(
@@ -599,10 +663,6 @@ impl RelightPipeline {
                 )
             })
             .unwrap_or(caps[0]);
-        eprintln!(
-            "editor surface format: {:?} (supported: {:?})",
-            format, caps
-        );
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_DST,
             format,
@@ -660,11 +720,11 @@ impl RelightPipeline {
             ],
         });
 
-        let mut encoder = self.device.create_command_encoder(
-            &wgpu::CommandEncoderDescriptor {
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("krust editor blit"),
-            },
-        );
+            });
         let frame_view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -694,10 +754,12 @@ impl RelightPipeline {
         if self.blit_format == Some(format) && self.blit_pipeline.is_some() {
             return;
         }
-        let blit_shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("krust editor blit"),
-            source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
-        });
+        let blit_shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("krust editor blit"),
+                source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+            });
         let blit_pipeline_layout =
             self.device
                 .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -780,9 +842,20 @@ fn upload_aux_textures(
     width: u32,
     height: u32,
     buffers: &FrameBuffers,
-) -> Result<(wgpu::Texture, wgpu::TextureView, wgpu::Texture, wgpu::TextureView), Box<dyn Error>> {
+) -> Result<
+    (
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::Texture,
+        wgpu::TextureView,
+    ),
+    Box<dyn Error>,
+> {
     let mut aux_data = vec![0f32; (width * height * 4) as usize];
     let mut normal_data = vec![0f32; (width * height * 4) as usize];
+    let mut position_data = vec![0f32; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
             let pixel = buffers.get_pixel(x, y);
@@ -795,6 +868,10 @@ fn upload_aux_textures(
             normal_data[i + 1] = pixel.normal.g as f32;
             normal_data[i + 2] = pixel.normal.b as f32;
             normal_data[i + 3] = 1.0;
+            position_data[i] = pixel.position.r as f32;
+            position_data[i + 1] = pixel.position.g as f32;
+            position_data[i + 2] = pixel.position.b as f32;
+            position_data[i + 3] = 1.0;
         }
     }
 
@@ -836,12 +913,26 @@ fn upload_aux_textures(
 
     let aux_texture = upload("krust aux albedo depth", &aux_data);
     let normal_texture = upload("krust aux normal", &normal_data);
+    let position_texture = upload("krust aux position", &position_data);
     let aux_view = aux_texture.create_view(&Default::default());
     let normal_view = normal_texture.create_view(&Default::default());
-    Ok((aux_texture, aux_view, normal_texture, normal_view))
+    let position_view = position_texture.create_view(&Default::default());
+    Ok((
+        aux_texture,
+        aux_view,
+        normal_texture,
+        normal_view,
+        position_texture,
+        position_view,
+    ))
 }
 
-fn create_rgba8_texture(device: &wgpu::Device, width: u32, height: u32, label: &str) -> wgpu::Texture {
+fn create_rgba8_texture(
+    device: &wgpu::Device,
+    width: u32,
+    height: u32,
+    label: &str,
+) -> wgpu::Texture {
     device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -885,11 +976,10 @@ fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
     }
 }
 
-fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
-    texture_entry_filterable(binding, wgpu::ShaderStages::COMPUTE)
-}
-
-fn texture_entry_filterable(binding: u32, stages: wgpu::ShaderStages) -> wgpu::BindGroupLayoutEntry {
+fn texture_entry_filterable(
+    binding: u32,
+    stages: wgpu::ShaderStages,
+) -> wgpu::BindGroupLayoutEntry {
     wgpu::BindGroupLayoutEntry {
         binding,
         visibility: stages,
@@ -1157,21 +1247,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 let light_type = u32(light.position.w + 0.5);
                 let emission = light.color.rgb * light.color.w;
 
-                // Irradiance model (matches CPU gather_light_from_paths):
-                // each recorded surface vertex receives 1/d^2 falloff from the
-                // virtual light, weighted by the light-agnostic throughput.
-                // The distance floor is raised (and the contribution clamped)
-                // so a vertex sitting almost on top of a light can't produce a
-                // firefly spike that shows up as salt-and-pepper noise.
-                let light_vec = light.position.xyz - p0;
-                let dist_sq = max(dot(light_vec, light_vec), 0.05);
-                let contrib = throughput * emission / dist_sq;
-                let contrib_max = 8.0;
-                accum = accum + min(contrib, vec3<f32>(contrib_max));
-
-                // Direct-visibility glow: if the recorded segment actually
-                // intersects the light geometry, add its full emission so the
-                // light source itself is visible in the frame.
+                // Paper-style GATHERLIGHT: if the light-agnostic path segment
+                // intersects the virtual emitter, gather its emission weighted
+                // by the path throughput.
                 var hit = false;
                 if (light_type == 0u) {
                     hit = intersect_segment_sphere(p0, p1, light.position.xyz, max(light.params.x, 0.01));
@@ -1216,7 +1294,7 @@ struct NrpHeader {
     hidden_dim: u32,
     output_dim: u32,
     num_layers: u32,
-    weight_count: u32,
+    hash_table_size: u32,
     hash_levels: u32,
     hash_features: u32,
     hash_offset: u32,
@@ -1227,7 +1305,8 @@ struct NrpHeader {
 @group(0) @binding(2) var<storage, read> lights: array<EditorLight>;
 @group(0) @binding(3) var aux_features: texture_2d<f32>;
 @group(0) @binding(4) var normal_features: texture_2d<f32>;
-@group(0) @binding(5) var output: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(5) var position_features: texture_2d<f32>;
+@group(0) @binding(6) var output: texture_storage_2d<rgba8unorm, write>;
 
 fn reinhard(c: vec3<f32>) -> vec3<f32> {
     let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -1235,16 +1314,41 @@ fn reinhard(c: vec3<f32>) -> vec3<f32> {
     return c * scale;
 }
 
-fn hash_grid(pixel: vec2<u32>, level: u32) -> vec3<f32> {
-    let scale = f32(1u << level);
-    let fx = f32(pixel.x) / f32(max(params.width, 1u)) * scale;
-    let fy = f32(pixel.y) / f32(max(params.height, 1u)) * scale;
-    let h = sin(vec2<f32>(fx * 12.9898, fy * 78.233)) * 43758.5453;
-    let r = fract(h);
-    return vec3<f32>(r.x, r.y, fract(r.x + r.y));
+fn hash_resolution(level: u32) -> u32 {
+    return max(u32(floor(16.0 * pow(1.3, f32(level)))), 1u);
 }
 
-fn mlp_eval(features: array<f32, 32>, feature_count: u32) -> vec3<f32> {
+fn hash_cell(ix: u32, iy: u32, level: u32, table_size: u32) -> u32 {
+    let hashed = (ix * 73856093u) ^ (iy * 19349663u) ^ (level * 83492791u);
+    return hashed % max(table_size, 1u);
+}
+
+fn hash_feature_at_cell(ix: u32, iy: u32, level: u32, feature: u32, header: NrpHeader) -> f32 {
+    let local_index = hash_cell(ix, iy, level, header.hash_table_size);
+    let table_index = (level * header.hash_table_size + local_index) * header.hash_features + feature;
+    return weights[header.hash_offset + table_index];
+}
+
+fn hash_feature(pixel: vec2<u32>, level: u32, feature: u32, header: NrpHeader) -> f32 {
+    let u = f32(pixel.x) / f32(max(params.width - 1u, 1u));
+    let v = f32(pixel.y) / f32(max(params.height - 1u, 1u));
+    let res = hash_resolution(level);
+    let coord = vec2<f32>(u, v) * f32(max(res - 1u, 1u));
+    let base = vec2<u32>(
+        min(u32(floor(coord.x)), res - 1u),
+        min(u32(floor(coord.y)), res - 1u)
+    );
+    let next = min(base + vec2<u32>(1u, 1u), vec2<u32>(res - 1u, res - 1u));
+    let t = coord - vec2<f32>(base);
+    let v00 = hash_feature_at_cell(base.x, base.y, level, feature, header);
+    let v10 = hash_feature_at_cell(next.x, base.y, level, feature, header);
+    let v01 = hash_feature_at_cell(base.x, next.y, level, feature, header);
+    let v11 = hash_feature_at_cell(next.x, next.y, level, feature, header);
+    return mix(mix(v00, v10, t.x), mix(v01, v11, t.x), t.y);
+}
+
+fn mlp_eval(features: array<f32, 64>, feature_count: u32) -> vec3<f32> {
+    var input_features = features;
     var hidden: array<f32, 256>;
     let header = NrpHeader(
         u32(weights[0]), u32(weights[1]), u32(weights[2]), u32(weights[3]),
@@ -1255,37 +1359,63 @@ fn mlp_eval(features: array<f32, 32>, feature_count: u32) -> vec3<f32> {
 
     for (var h = 0u; h < hidden_dim; h = h + 1u) {
         var sum = 0.0;
-        for (var i = 0u; i < min(feature_count, 32u); i = i + 1u) {
-            sum = sum + features[i] * weights[offset + h * feature_count + i];
+        for (var i = 0u; i < min(feature_count, 64u); i = i + 1u) {
+            sum = sum + input_features[i] * weights[offset + h * feature_count + i];
         }
-        hidden[h] = max(sum, 0.0);
+        hidden[h] = max(sum + weights[offset + hidden_dim * feature_count + h], 0.0);
     }
-    offset = offset + hidden_dim * feature_count;
+    offset = offset + hidden_dim * feature_count + hidden_dim;
 
-    for (var layer = 1u; layer < header.num_layers; layer = layer + 1u) {
+    for (var layer = 1u; layer + 1u < header.num_layers; layer = layer + 1u) {
         var next_hidden: array<f32, 256>;
         for (var h = 0u; h < hidden_dim; h = h + 1u) {
             var sum = 0.0;
             for (var i = 0u; i < hidden_dim; i = i + 1u) {
                 sum = sum + hidden[i] * weights[offset + h * hidden_dim + i];
             }
-            next_hidden[h] = max(sum, 0.0);
+            next_hidden[h] = max(sum + weights[offset + hidden_dim * hidden_dim + h], 0.0);
         }
-        offset = offset + hidden_dim * hidden_dim;
+        offset = offset + hidden_dim * hidden_dim + hidden_dim;
         for (var h = 0u; h < hidden_dim; h = h + 1u) {
             hidden[h] = next_hidden[h];
         }
     }
 
-    var out_rgb = vec3<f32>(0.0);
-    for (var c = 0u; c < 3u; c = c + 1u) {
-        var sum = 0.0;
-        for (var i = 0u; i < hidden_dim; i = i + 1u) {
-            sum = sum + hidden[i] * weights[offset + c * hidden_dim + i];
-        }
-        out_rgb[c] = log(1.0 + exp(sum));
+    var sum_r = 0.0;
+    var sum_g = 0.0;
+    var sum_b = 0.0;
+    for (var i = 0u; i < hidden_dim; i = i + 1u) {
+        sum_r = sum_r + hidden[i] * weights[offset + i];
+        sum_g = sum_g + hidden[i] * weights[offset + hidden_dim + i];
+        sum_b = sum_b + hidden[i] * weights[offset + hidden_dim * 2u + i];
     }
-    return out_rgb;
+    return vec3<f32>(
+        sum_r + weights[offset + 3u * hidden_dim],
+        sum_g + weights[offset + 3u * hidden_dim + 1u],
+        sum_b + weights[offset + 3u * hidden_dim + 2u]
+    );
+}
+
+fn direct_light_estimate(
+    albedo_depth: vec4<f32>,
+    normal_value: vec4<f32>,
+    position_value: vec4<f32>,
+    light: EditorLight,
+) -> vec3<f32> {
+    if (albedo_depth.a <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let normal_len = length(normal_value.xyz);
+    if (normal_len <= 0.000001) {
+        return vec3<f32>(0.0);
+    }
+    let n = normal_value.xyz / normal_len;
+    let light_vec = light.position.xyz - position_value.xyz;
+    let dist_sq = max(dot(light_vec, light_vec), 0.0001);
+    let light_dir = light_vec / sqrt(dist_sq);
+    let ndotl = max(dot(n, light_dir), 0.0);
+    let radius = max(light.params.x, 0.01);
+    return albedo_depth.rgb * light.color.rgb * light.color.w * ndotl * (radius * radius / dist_sq);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1294,36 +1424,56 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
     let pixel = id.xy;
-    let aux = textureLoad(aux_features, vec2<i32>(pixel), 0);
-    let normal = textureLoad(normal_features, vec2<i32>(pixel), 0);
     var accum = vec3<f32>(0.0);
 
     for (var l = 0u; l < params.light_count; l = l + 1u) {
         let light = lights[l];
-        var features: array<f32, 32>;
-        features[0] = f32(pixel.x) / f32(max(params.width, 1u));
-        features[1] = f32(pixel.y) / f32(max(params.height, 1u));
-        features[2] = aux.r;
-        features[3] = aux.g;
-        features[4] = aux.b;
-        features[5] = aux.a;
-        features[6] = normal.r;
-        features[7] = normal.g;
-        features[8] = normal.b;
-        features[9] = light.position.x;
-        features[10] = light.position.y;
-        features[11] = light.position.z;
-        features[12] = light.params.x;
-        features[13] = light.color.r;
-        features[14] = light.color.g;
-        features[15] = light.color.b;
-        features[16] = light.color.w;
-        let hash = hash_grid(pixel, 0u);
-        features[17] = hash.x;
-        features[18] = hash.y;
-        features[19] = hash.z;
-        let contrib = mlp_eval(features, 23u);
-        accum = accum + contrib * light.color.w;
+        let header = NrpHeader(
+            u32(weights[0]), u32(weights[1]), u32(weights[2]), u32(weights[3]),
+            u32(weights[4]), u32(weights[5]), u32(weights[6]), u32(weights[7])
+        );
+        var features: array<f32, 64>;
+        let u = f32(pixel.x) / f32(max(params.width - 1u, 1u));
+        let v = f32(pixel.y) / f32(max(params.height - 1u, 1u));
+
+        var feature_index = 0u;
+        for (var level = 0u; level < min(header.hash_levels, 16u); level = level + 1u) {
+            for (var feature = 0u; feature < min(header.hash_features, 2u); feature = feature + 1u) {
+                features[feature_index] = hash_feature(pixel, level, feature, header);
+                feature_index = feature_index + 1u;
+            }
+        }
+        features[feature_index + 0u] = u;
+        features[feature_index + 1u] = v;
+        features[feature_index + 2u] = light.position.x;
+        features[feature_index + 3u] = light.position.y;
+        features[feature_index + 4u] = light.position.z;
+        features[feature_index + 5u] = light.params.x;
+        features[feature_index + 6u] = light.color.r;
+        features[feature_index + 7u] = light.color.g;
+        features[feature_index + 8u] = light.color.b;
+        features[feature_index + 9u] = log(max(light.color.w, 0.0001));
+        let aux = textureLoad(aux_features, vec2<i32>(pixel), 0);
+        let normal = textureLoad(normal_features, vec2<i32>(pixel), 0);
+        let position = textureLoad(position_features, vec2<i32>(pixel), 0);
+        features[feature_index + 10u] = aux.r;
+        features[feature_index + 11u] = aux.g;
+        features[feature_index + 12u] = aux.b;
+        features[feature_index + 13u] = log(1.0 + max(aux.a, 0.0));
+        features[feature_index + 14u] = normal.r;
+        features[feature_index + 15u] = normal.g;
+        features[feature_index + 16u] = normal.b;
+        features[feature_index + 17u] = position.r;
+        features[feature_index + 18u] = position.g;
+        features[feature_index + 19u] = position.b;
+
+        // Use the deterministic direct-light proxy as the interactive
+        // relighting baseline. The MLP path remains wired for future
+        // residual/multibounce training, but an underfit checkpoint must not
+        // hide light movement in the editor.
+        let direct_contrib = direct_light_estimate(aux, normal, position, light);
+        let contrib = direct_contrib;
+        accum = accum + contrib;
     }
 
     let ldr = pow(clamp(reinhard(accum), vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(1.0 / 2.2));

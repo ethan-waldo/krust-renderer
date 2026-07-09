@@ -23,6 +23,7 @@ pub struct RelightEditorSettings {
     pub path_depth: u32,
     pub export_jsonl: Option<PathBuf>,
     pub nrp_weights: Option<PathBuf>,
+    pub start_nrp: bool,
     pub output_dir: PathBuf,
 }
 
@@ -59,7 +60,10 @@ pub fn run(
             ),
         ]
     } else {
-        initial_lights.iter().map(EditorLight::from_virtual).collect()
+        initial_lights
+            .iter()
+            .map(EditorLight::from_virtual)
+            .collect()
     };
 
     let event_loop = EventLoop::new();
@@ -81,9 +85,15 @@ pub fn run(
         initial_size.height.max(1),
     );
 
-    // Diagnostic: render one relit frame to a PNG so the gather pass can be
-    // inspected independently of the interactive window.
-    pipeline.gather_and_tonemap(&lights, false);
+    let nrp_available = pipeline.nrp_available();
+    let mut use_nrp = nrp_available && settings.start_nrp;
+    if !use_nrp && nrp_available {
+        eprintln!("starting in raw GATHERLIGHT reference mode; press N for neural relighting");
+    }
+
+    // Diagnostic: render one relit frame to a PNG so the active relighting pass
+    // can be inspected independently of the interactive window.
+    pipeline.gather_and_tonemap(&lights, use_nrp);
     let debug_png = settings.output_dir.join("relight_debug.png");
     match pipeline.save_ldr_png(&debug_png) {
         Ok(()) => eprintln!("wrote diagnostic frame to {}", debug_png.display()),
@@ -92,8 +102,6 @@ pub fn run(
     let mut selected = 0usize;
     let mut dragging = false;
     let mut last_cursor = (0.0f32, 0.0f32);
-    let mut use_nrp = false;
-    let nrp_available = pipeline.nrp_available();
     let mut dirty = true;
     let output_dir = settings.output_dir.clone();
     window.set_title(&window_title(&lights, selected, use_nrp, nrp_available));
@@ -102,64 +110,55 @@ pub fn run(
         *control_flow = ControlFlow::Poll;
 
         match event {
-            Event::WindowEvent { event, window_id } if window_id == window.id() => {
-                match event {
-                    WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
-                    WindowEvent::Resized(size) => {
-                        surface_config = pipeline.configure_surface(
-                            &surface,
-                            size.width.max(1),
-                            size.height.max(1),
+            Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
+                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                WindowEvent::Resized(size) => {
+                    surface_config =
+                        pipeline.configure_surface(&surface, size.width.max(1), size.height.max(1));
+                    dirty = true;
+                }
+                WindowEvent::MouseInput { state, button, .. } => {
+                    if button == MouseButton::Left {
+                        dragging = state == ElementState::Pressed;
+                    }
+                }
+                WindowEvent::CursorMoved { position, .. } => {
+                    let (x, y) = (position.x as f32, position.y as f32);
+                    if dragging && selected < lights.len() {
+                        let dx = (x - last_cursor.0) as f64 * 0.01;
+                        let dy = (y - last_cursor.1) as f64 * 0.01;
+                        let light = &mut lights[selected];
+                        light.position = Vec3::new(
+                            (light.position.x() + dx).clamp(-12.0, 12.0),
+                            (light.position.y() - dy).clamp(-2.0, 12.0),
+                            light.position.z(),
                         );
                         dirty = true;
+                        window.set_title(&window_title(&lights, selected, use_nrp, nrp_available));
                     }
-                    WindowEvent::MouseInput { state, button, .. } => {
-                        if button == MouseButton::Left {
-                            dragging = state == ElementState::Pressed;
-                        }
-                    }
-                    WindowEvent::CursorMoved { position, .. } => {
-                        let (x, y) = (position.x as f32, position.y as f32);
-                        if dragging && selected < lights.len() {
-                            let dx = (x - last_cursor.0) as f64 * 0.02;
-                            let dy = (y - last_cursor.1) as f64 * 0.02;
-                            let light = &mut lights[selected];
-                            light.position = Vec3::new(
-                                light.position.x() + dx,
-                                light.position.y() - dy,
-                                light.position.z(),
-                            );
-                            dirty = true;
-                            window.set_title(&window_title(
-                                &lights, selected, use_nrp, nrp_available,
-                            ));
-                        }
-                        last_cursor = (x, y);
-                    }
-                    WindowEvent::KeyboardInput { input, .. } => {
-                        if input.state == ElementState::Pressed {
-                            if input.virtual_keycode == Some(VirtualKeyCode::Escape) {
-                                *control_flow = ControlFlow::Exit;
-                                return;
-                            }
-                            handle_key(
-                                input,
-                                &mut lights,
-                                &mut selected,
-                                &mut use_nrp,
-                                nrp_available,
-                                &mut dirty,
-                                &output_dir,
-                                &pipeline,
-                            );
-                            window.set_title(&window_title(
-                                &lights, selected, use_nrp, nrp_available,
-                            ));
-                        }
-                    }
-                    _ => {}
+                    last_cursor = (x, y);
                 }
-            }
+                WindowEvent::KeyboardInput { input, .. } => {
+                    if input.state == ElementState::Pressed {
+                        if input.virtual_keycode == Some(VirtualKeyCode::Escape) {
+                            *control_flow = ControlFlow::Exit;
+                            return;
+                        }
+                        handle_key(
+                            input,
+                            &mut lights,
+                            &mut selected,
+                            &mut use_nrp,
+                            nrp_available,
+                            &mut dirty,
+                            &output_dir,
+                            &pipeline,
+                        );
+                        window.set_title(&window_title(&lights, selected, use_nrp, nrp_available));
+                    }
+                }
+                _ => {}
+            },
             Event::RedrawRequested(window_id) if window_id == window.id() => {
                 if dirty {
                     pipeline.gather_and_tonemap(&lights, use_nrp);
@@ -186,7 +185,8 @@ fn print_shortcuts() {
   + / -      : intensity up / down\n\
   Tab        : toggle sphere / quad light type\n\
   A          : add a new light\n\
-  N          : toggle NRP inference (needs trained weights)\n\
+  N          : neural proxy view (needs trained weights)\n\
+  G          : noisy raw gather reference\n\
   S          : export recorded paths (editor_paths.jsonl)\n\
   O          : export lights (editor_lights.json)\n\
   I          : solve lighting via NRP optimizer\n\
@@ -202,7 +202,7 @@ fn window_title(
     use_nrp: bool,
     nrp_available: bool,
 ) -> String {
-    let mode = if use_nrp { "NRP" } else { "gather" };
+    let mode = if use_nrp { "NRP" } else { "gather noisy-ref" };
     let nrp_hint = if nrp_available { "" } else { " (no weights)" };
     let light_info = if selected < lights.len() {
         let l = &lights[selected];
@@ -224,7 +224,7 @@ fn window_title(
         "no light".to_string()
     };
     format!(
-        "Krust Relight [{mode}{nrp_hint}] {light_info} | {} lights | 1/2/3 sel  drag move  +/- int  Tab type  A add  N nrp  S/O export  I solve",
+        "Krust Relight [{mode}{nrp_hint}] {light_info} | {} lights | 1/2/3 sel  drag move  +/- int  Tab type  A add  N neural  G gather-ref  S/O export  I solve",
         lights.len(),
     )
 }
@@ -253,7 +253,16 @@ fn handle_key(
             *dirty = true;
         }
         VirtualKeyCode::N if nrp_available => {
-            *use_nrp = !*use_nrp;
+            *use_nrp = true;
+            *dirty = true;
+        }
+        VirtualKeyCode::G => {
+            if nrp_available {
+                eprintln!(
+                    "showing raw GATHERLIGHT reference; this is a noisy Monte Carlo diagnostic"
+                );
+            }
+            *use_nrp = false;
             *dirty = true;
         }
         VirtualKeyCode::Key1 => *selected = 0,
