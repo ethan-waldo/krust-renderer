@@ -1832,6 +1832,27 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (best.hit) {
         let material = materials[best.material];
         let albedo = sample_texture(material.textures0.x, best.uv, material.diffuse);
+        let diffuse_weight = sample_texture(
+            material.textures0.y,
+            best.uv,
+            vec4<f32>(
+                material.params.y,
+                material.params.y,
+                material.params.y,
+                material.params.y,
+            ),
+        );
+        let specular_weight = sample_texture(
+            material.textures0.w,
+            best.uv,
+            vec4<f32>(
+                material.params.z,
+                material.params.z,
+                material.params.z,
+                material.params.z,
+            ),
+        );
+        let specular = sample_texture(material.textures0.z, best.uv, material.specular);
         let roughness = sample_texture(
             material.textures1.x,
             best.uv,
@@ -1842,12 +1863,28 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 material.params.x,
             ),
         );
+        let metallic = sample_texture(
+            material.textures1.y,
+            best.uv,
+            vec4<f32>(
+                material.params2.x,
+                material.params2.x,
+                material.params2.x,
+                material.params2.x,
+            ),
+        );
         let emission = sample_texture(material.textures1.w, best.uv, material.emission);
         let normal = perturb_normal(material, best.uv, best.normal);
         lobes.emission = emission;
         lobes.normal = vec4<f32>(normal, 1.0);
         lobes.albedo = albedo;
-        lobes.roughness = vec4<f32>(roughness.r, roughness.r, roughness.r, 1.0);
+        lobes.specular = vec4<f32>(specular.rgb, specular_weight.r);
+        lobes.roughness = vec4<f32>(
+            roughness.r,
+            metallic.r,
+            specular_weight.r,
+            diffuse_weight.r,
+        );
         lobes.depth = vec4<f32>(best.t, best.t, best.t, 1.0);
         lobes.position = vec4<f32>(best.position, 1.0);
         lobes.rgba = vec4<f32>(albedo.rgb + emission.rgb, 1.0);

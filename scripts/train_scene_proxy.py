@@ -279,6 +279,18 @@ def direct_light_target(aux_pixel: np.ndarray, light: dict) -> np.ndarray:
     depth_log = float(aux_pixel[3])
     normal = aux_pixel[4:7].astype(np.float32)
     position = aux_pixel[7:10].astype(np.float32)
+    roughness = 0.5
+    metallic = 0.0
+    specular_weight = 0.0
+    diffuse_weight = 1.0
+    specular_color = np.ones(3, dtype=np.float32)
+    if aux_pixel.shape[0] >= 14:
+        roughness = float(np.clip(aux_pixel[10], 0.02, 1.0))
+        metallic = float(np.clip(aux_pixel[11], 0.0, 1.0))
+        specular_weight = float(np.clip(aux_pixel[12], 0.0, 1.0))
+        diffuse_weight = float(np.clip(aux_pixel[13] - metallic, 0.0, 1.0))
+    if aux_pixel.shape[0] >= 20:
+        specular_color = aux_pixel[17:20].astype(np.float32)
     if depth_log <= 0.0 or not np.isfinite(position).all():
         return np.zeros(3, dtype=np.float32)
     normal_len = np.linalg.norm(normal)
@@ -294,10 +306,33 @@ def direct_light_target(aux_pixel: np.ndarray, light: dict) -> np.ndarray:
     if ndotl <= 0.0:
         return np.zeros(3, dtype=np.float32)
 
+    if aux_pixel.shape[0] >= 17:
+        view_dir = aux_pixel[14:17].astype(np.float32)
+        view_len = float(np.linalg.norm(view_dir))
+        if view_len > 1e-4:
+            view_dir = view_dir / view_len
+        else:
+            view_len = max(float(np.linalg.norm(position)), 1e-4)
+            view_dir = -position / view_len
+    else:
+        view_len = max(float(np.linalg.norm(position)), 1e-4)
+        view_dir = -position / view_len
+    half_dir = light_dir + view_dir
+    half_len = max(float(np.linalg.norm(half_dir)), 1e-4)
+    half_dir = half_dir / half_len
+    spec_power = ((1.0 - roughness) ** 4.0) * 1000.0 + 3.5
+    spec_color = (1.0 - metallic) * specular_color + metallic * albedo
+    specular = (
+        spec_color
+        * specular_weight
+        * (max(float(np.dot(normal, half_dir)), 0.0) ** spec_power)
+    )
+    diffuse = albedo * diffuse_weight * ndotl
+
     color = np.array(light.get("color", [1.0, 1.0, 1.0]), dtype=np.float32)
     intensity = float(light.get("intensity", 1.0))
     radius = max(float(light.get("radius", 0.5)), 0.01)
-    radiance = albedo * color * intensity * ndotl * (radius * radius / dist2)
+    radiance = (diffuse + specular) * color * intensity * (radius * radius / dist2)
     return np.minimum(radiance, 32.0).astype(np.float32)
 
 
@@ -389,11 +424,16 @@ def build_light_features(
 
 def build_aux_features(px: int, py: int, aux: np.ndarray | None) -> np.ndarray:
     if aux is None or py >= aux.shape[0] or px >= aux.shape[1]:
-        return np.zeros(10, dtype=np.float32)
-    features = aux[py, px, : min(aux.shape[2], 10)].astype(np.float32)
-    if features.shape[0] < 10:
-        padded = np.zeros(10, dtype=np.float32)
+        features = np.zeros(20, dtype=np.float32)
+        features[13] = 1.0
+        features[17:20] = 1.0
+        return features
+    features = aux[py, px, : min(aux.shape[2], 20)].astype(np.float32)
+    if features.shape[0] < 20:
+        padded = np.zeros(20, dtype=np.float32)
         padded[: features.shape[0]] = features
+        padded[13] = 1.0
+        padded[17:20] = 1.0
         return padded
     return features
 
@@ -428,9 +468,11 @@ def main() -> None:
         height = int(aux_data.get("height", height))
         feature_count = int(aux_data.get("feature_count", 4))
         aux = np.array(aux_data["features"], dtype=np.float32).reshape(height, width, feature_count)
-        if feature_count < 10:
-            padded = np.zeros((height, width, 10), dtype=np.float32)
+        if feature_count < 20:
+            padded = np.zeros((height, width, 20), dtype=np.float32)
             padded[:, :, :feature_count] = aux
+            padded[:, :, 13] = 1.0
+            padded[:, :, 17:20] = 1.0
             aux = padded
 
     pixels = list(records_index.keys()) or [(x, y) for y in range(height) for x in range(width)]
@@ -569,9 +611,9 @@ def main() -> None:
                 "lights": lights,
                 "training_light_count": len(training_lights),
                 "lights_per_pixel": args.lights_per_pixel,
-                "aux_feature_count": 10 if aux is not None else 0,
+                "aux_feature_count": 20 if aux is not None else 0,
                 "target_space": "log1p_radiance",
-                "target_model": "direct_feature_v4" if aux is not None and aux.shape[2] >= 10 else "segment_gather_denoised_v3",
+                "target_model": "direct_material_specular_v7" if aux is not None and aux.shape[2] >= 20 else "segment_gather_denoised_v3",
                 "hash_interpolation": "bilinear",
                 "target_denoise_radius": args.target_denoise_radius,
                 "target_denoise_passes": args.target_denoise_passes,

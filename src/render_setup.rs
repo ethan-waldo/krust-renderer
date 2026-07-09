@@ -1125,7 +1125,7 @@ fn write_nrp_aux_features(
     }
 
     let buffers = gpu::render_first_hit_aovs(width, height, camera, objects, directional_lights)?;
-    let mut features = Vec::with_capacity((width * height * 10) as usize);
+    let mut features = Vec::with_capacity((width * height * 20) as usize);
     for y in 0..height {
         for x in 0..width {
             let pixel = buffers.get_pixel(x, y);
@@ -1139,13 +1139,33 @@ fn write_nrp_aux_features(
             features.push(pixel.position.r);
             features.push(pixel.position.g);
             features.push(pixel.position.b);
+            features.push(pixel.roughness.r);
+            features.push(pixel.roughness.g);
+            features.push(pixel.roughness.b);
+            features.push(pixel.roughness.a);
+            let view = Vec3::new(
+                camera.origin.x - pixel.position.r,
+                camera.origin.y - pixel.position.g,
+                camera.origin.z - pixel.position.b,
+            );
+            let view = if view.length() > 0.0001 {
+                view.normalize()
+            } else {
+                Vec3::zeros()
+            };
+            features.push(view.x);
+            features.push(view.y);
+            features.push(view.z);
+            features.push(pixel.specular.r);
+            features.push(pixel.specular.g);
+            features.push(pixel.specular.b);
         }
     }
 
     let payload = serde_json::json!({
         "width": width,
         "height": height,
-        "feature_count": 10,
+        "feature_count": 20,
         "features": features,
     });
     let payload = serde_json::to_string(&payload)?;
@@ -1173,7 +1193,7 @@ fn nrp_weights_need_training(settings: &RelightingSettings) -> bool {
         f32::from_le_bytes(raw).round().max(0.0) as u32
     };
 
-    let expected_input_dim = settings.nrp_hash_levels * settings.nrp_hash_features + 10 + 10;
+    let expected_input_dim = settings.nrp_hash_levels * settings.nrp_hash_features + 10 + 20;
     if read_u32(0) != expected_input_dim
         || read_u32(4) != settings.nrp_hash_table_size
         || read_u32(5) != settings.nrp_hash_levels
@@ -1190,7 +1210,7 @@ fn nrp_weights_need_training(settings: &RelightingSettings) -> bool {
         return true;
     };
 
-    meta["target_model"].as_str() != Some("direct_feature_v4")
+    meta["target_model"].as_str() != Some("direct_material_specular_v7")
         || meta["hash_interpolation"].as_str() != Some("bilinear")
 }
 

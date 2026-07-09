@@ -198,9 +198,11 @@ def load_aux(path: str | None, width: int, height: int) -> np.ndarray | None:
         int(aux_data.get("width", width)),
         feature_count,
     )
-    if feature_count < 10:
-        padded = np.zeros((aux.shape[0], aux.shape[1], 10), dtype=np.float32)
+    if feature_count < 20:
+        padded = np.zeros((aux.shape[0], aux.shape[1], 20), dtype=np.float32)
         padded[:, :, :feature_count] = aux
+        padded[:, :, 13] = 1.0
+        padded[:, :, 17:20] = 1.0
         aux = padded
     return aux
 
@@ -209,8 +211,11 @@ def aux_features(px: int, py: int, aux: np.ndarray | None) -> "torch.Tensor":
     import torch
 
     if aux is None or py >= aux.shape[0] or px >= aux.shape[1]:
-        return torch.zeros(10, dtype=torch.float32)
-    return torch.tensor(aux[py, px, :10], dtype=torch.float32)
+        features = torch.zeros(20, dtype=torch.float32)
+        features[13] = 1.0
+        features[17:20] = 1.0
+        return features
+    return torch.tensor(aux[py, px, :20], dtype=torch.float32)
 
 
 def main() -> None:

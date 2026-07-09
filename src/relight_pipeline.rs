@@ -87,6 +87,7 @@ struct GatherParams {
     use_nrp: u32,
     chunk_spp: u32,
     _pad: u32,
+    camera_origin: [f32; 4],
 }
 
 unsafe impl bytemuck::Pod for GatherParams {}
@@ -114,6 +115,7 @@ pub struct RelightPipeline {
     height: u32,
     samples_per_pixel: u32,
     max_depth: u32,
+    camera_origin: Vec3,
     path_chunks: Vec<wgpu::Buffer>,
     chunk_spp: u64,
     chunk_valid_counts: Vec<u64>,
@@ -124,6 +126,10 @@ pub struct RelightPipeline {
     normal_view: wgpu::TextureView,
     _position_texture: wgpu::Texture,
     position_view: wgpu::TextureView,
+    _material_texture: wgpu::Texture,
+    material_view: wgpu::TextureView,
+    _specular_texture: wgpu::Texture,
+    specular_view: wgpu::TextureView,
     ldr_texture: wgpu::Texture,
     ldr_view: wgpu::TextureView,
     gather_pipeline: wgpu::ComputePipeline,
@@ -211,6 +217,7 @@ impl RelightPipeline {
             height,
             samples_per_pixel,
             max_depth,
+            camera.origin,
             &aux_buffers,
         ))
     }
@@ -221,6 +228,7 @@ impl RelightPipeline {
         height: u32,
         samples_per_pixel: u32,
         max_depth: u32,
+        camera_origin: Vec3,
         aux_buffers: &FrameBuffers,
     ) -> Result<Self, Box<dyn Error>> {
         let GpuPathCache {
@@ -234,8 +242,18 @@ impl RelightPipeline {
             path_count,
         } = path_cache;
 
-        let (aux_texture, aux_view, normal_texture, normal_view, position_texture, position_view) =
-            upload_aux_textures(&device, &queue, width, height, aux_buffers)?;
+        let (
+            aux_texture,
+            aux_view,
+            normal_texture,
+            normal_view,
+            position_texture,
+            position_view,
+            material_texture,
+            material_view,
+            specular_texture,
+            specular_view,
+        ) = upload_aux_textures(&device, &queue, width, height, aux_buffers)?;
         let ldr_texture = create_rgba8_texture(&device, width, height, "krust ldr");
         let ldr_view = ldr_texture.create_view(&Default::default());
 
@@ -305,6 +323,7 @@ impl RelightPipeline {
             height,
             samples_per_pixel,
             max_depth,
+            camera_origin,
             path_chunks,
             chunk_spp,
             chunk_valid_counts,
@@ -315,6 +334,10 @@ impl RelightPipeline {
             normal_view,
             _position_texture: position_texture,
             position_view,
+            _material_texture: material_texture,
+            material_view,
+            _specular_texture: specular_texture,
+            specular_view,
             ldr_texture,
             ldr_view,
             gather_pipeline,
@@ -348,7 +371,9 @@ impl RelightPipeline {
                         texture_entry_non_filterable(3),
                         texture_entry_non_filterable(4),
                         texture_entry_non_filterable(5),
-                        storage_texture_rgba8_entry(6),
+                        texture_entry_non_filterable(6),
+                        texture_entry_non_filterable(7),
+                        storage_texture_rgba8_entry(8),
                     ],
                 });
         let nrp_pipeline = self
@@ -405,6 +430,12 @@ impl RelightPipeline {
             use_nrp: if use_nrp { 1 } else { 0 },
             chunk_spp: self.chunk_spp as u32,
             _pad: 0,
+            camera_origin: [
+                self.camera_origin.x as f32,
+                self.camera_origin.y as f32,
+                self.camera_origin.z as f32,
+                0.0,
+            ],
         };
         let gather_params_buffer =
             self.device
@@ -501,6 +532,14 @@ impl RelightPipeline {
                         },
                         wgpu::BindGroupEntry {
                             binding: 6,
+                            resource: wgpu::BindingResource::TextureView(&self.material_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 7,
+                            resource: wgpu::BindingResource::TextureView(&self.specular_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 8,
                             resource: wgpu::BindingResource::TextureView(&self.ldr_view),
                         },
                     ],
@@ -850,12 +889,18 @@ fn upload_aux_textures(
         wgpu::TextureView,
         wgpu::Texture,
         wgpu::TextureView,
+        wgpu::Texture,
+        wgpu::TextureView,
+        wgpu::Texture,
+        wgpu::TextureView,
     ),
     Box<dyn Error>,
 > {
     let mut aux_data = vec![0f32; (width * height * 4) as usize];
     let mut normal_data = vec![0f32; (width * height * 4) as usize];
     let mut position_data = vec![0f32; (width * height * 4) as usize];
+    let mut material_data = vec![0f32; (width * height * 4) as usize];
+    let mut specular_data = vec![0f32; (width * height * 4) as usize];
     for y in 0..height {
         for x in 0..width {
             let pixel = buffers.get_pixel(x, y);
@@ -872,6 +917,14 @@ fn upload_aux_textures(
             position_data[i + 1] = pixel.position.g as f32;
             position_data[i + 2] = pixel.position.b as f32;
             position_data[i + 3] = 1.0;
+            material_data[i] = pixel.roughness.r as f32;
+            material_data[i + 1] = pixel.roughness.g as f32;
+            material_data[i + 2] = pixel.roughness.b as f32;
+            material_data[i + 3] = pixel.roughness.a as f32;
+            specular_data[i] = pixel.specular.r as f32;
+            specular_data[i + 1] = pixel.specular.g as f32;
+            specular_data[i + 2] = pixel.specular.b as f32;
+            specular_data[i + 3] = pixel.specular.a as f32;
         }
     }
 
@@ -914,9 +967,13 @@ fn upload_aux_textures(
     let aux_texture = upload("krust aux albedo depth", &aux_data);
     let normal_texture = upload("krust aux normal", &normal_data);
     let position_texture = upload("krust aux position", &position_data);
+    let material_texture = upload("krust aux material", &material_data);
+    let specular_texture = upload("krust aux specular", &specular_data);
     let aux_view = aux_texture.create_view(&Default::default());
     let normal_view = normal_texture.create_view(&Default::default());
     let position_view = position_texture.create_view(&Default::default());
+    let material_view = material_texture.create_view(&Default::default());
+    let specular_view = specular_texture.create_view(&Default::default());
     Ok((
         aux_texture,
         aux_view,
@@ -924,6 +981,10 @@ fn upload_aux_textures(
         normal_view,
         position_texture,
         position_view,
+        material_texture,
+        material_view,
+        specular_texture,
+        specular_view,
     ))
 }
 
@@ -1109,6 +1170,7 @@ struct GatherParams {
     use_nrp: u32,
     chunk_spp: u32,
     _pad1: u32,
+    camera_origin: vec4<f32>,
 };
 
 @group(0) @binding(0) var<storage, read> paths0: array<PackedPathVertex>;
@@ -1279,6 +1341,7 @@ struct GatherParams {
     use_nrp: u32,
     _pad0: u32,
     _pad1: u32,
+    camera_origin: vec4<f32>,
 };
 
 struct EditorLight {
@@ -1306,7 +1369,9 @@ struct NrpHeader {
 @group(0) @binding(3) var aux_features: texture_2d<f32>;
 @group(0) @binding(4) var normal_features: texture_2d<f32>;
 @group(0) @binding(5) var position_features: texture_2d<f32>;
-@group(0) @binding(6) var output: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(6) var material_features: texture_2d<f32>;
+@group(0) @binding(7) var specular_features: texture_2d<f32>;
+@group(0) @binding(8) var output: texture_storage_2d<rgba8unorm, write>;
 
 fn reinhard(c: vec3<f32>) -> vec3<f32> {
     let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -1400,6 +1465,8 @@ fn direct_light_estimate(
     albedo_depth: vec4<f32>,
     normal_value: vec4<f32>,
     position_value: vec4<f32>,
+    material_value: vec4<f32>,
+    specular_value: vec4<f32>,
     light: EditorLight,
 ) -> vec3<f32> {
     if (albedo_depth.a <= 0.0) {
@@ -1415,7 +1482,21 @@ fn direct_light_estimate(
     let light_dir = light_vec / sqrt(dist_sq);
     let ndotl = max(dot(n, light_dir), 0.0);
     let radius = max(light.params.x, 0.01);
-    return albedo_depth.rgb * light.color.rgb * light.color.w * ndotl * (radius * radius / dist_sq);
+    let roughness = clamp(material_value.r, 0.02, 1.0);
+    let metallic = clamp(material_value.g, 0.0, 1.0);
+    let specular_weight = clamp(material_value.b, 0.0, 1.0);
+    let diffuse_weight = clamp(material_value.a - metallic, 0.0, 1.0);
+    let diffuse = albedo_depth.rgb * diffuse_weight * ndotl;
+
+    let view_vec = params.camera_origin.xyz - position_value.xyz;
+    let view_len = max(length(view_vec), 0.0001);
+    let view_dir = view_vec / view_len;
+    let half_dir = normalize(light_dir + view_dir);
+    let spec_power = pow(1.0 - roughness, 4.0) * 1000.0 + 3.5;
+    let spec_color = mix(specular_value.rgb, albedo_depth.rgb, metallic);
+    let specular = spec_color * specular_weight * pow(max(dot(n, half_dir), 0.0), spec_power);
+
+    return (diffuse + specular) * light.color.rgb * light.color.w * (radius * radius / dist_sq);
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1456,6 +1537,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let aux = textureLoad(aux_features, vec2<i32>(pixel), 0);
         let normal = textureLoad(normal_features, vec2<i32>(pixel), 0);
         let position = textureLoad(position_features, vec2<i32>(pixel), 0);
+        let material = textureLoad(material_features, vec2<i32>(pixel), 0);
+        let specular = textureLoad(specular_features, vec2<i32>(pixel), 0);
         features[feature_index + 10u] = aux.r;
         features[feature_index + 11u] = aux.g;
         features[feature_index + 12u] = aux.b;
@@ -1466,12 +1549,25 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         features[feature_index + 17u] = position.r;
         features[feature_index + 18u] = position.g;
         features[feature_index + 19u] = position.b;
+        features[feature_index + 20u] = material.r;
+        features[feature_index + 21u] = material.g;
+        features[feature_index + 22u] = material.b;
+        features[feature_index + 23u] = material.a;
+        let view_vec = params.camera_origin.xyz - position.xyz;
+        let view_len = max(length(view_vec), 0.0001);
+        let view_dir = view_vec / view_len;
+        features[feature_index + 24u] = view_dir.x;
+        features[feature_index + 25u] = view_dir.y;
+        features[feature_index + 26u] = view_dir.z;
+        features[feature_index + 27u] = specular.r;
+        features[feature_index + 28u] = specular.g;
+        features[feature_index + 29u] = specular.b;
 
         // Use the deterministic direct-light proxy as the interactive
         // relighting baseline. The MLP path remains wired for future
         // residual/multibounce training, but an underfit checkpoint must not
         // hide light movement in the editor.
-        let direct_contrib = direct_light_estimate(aux, normal, position, light);
+        let direct_contrib = direct_light_estimate(aux, normal, position, material, specular, light);
         let contrib = direct_contrib;
         accum = accum + contrib;
     }
