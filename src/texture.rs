@@ -3,6 +3,7 @@ use image::codecs::hdr::HdrDecoder;
 use image::{ImageBuffer, Rgb};
 use palette::Srgb;
 use rayon::prelude::*;
+use std::error::Error;
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -13,17 +14,25 @@ pub struct TextureMap {
 
 impl TextureMap {
     pub fn new(file_path: &str, srgb: bool) -> Self {
+        Self::try_new(file_path, srgb)
+            .unwrap_or_else(|err| panic!("failed to load texture {file_path}: {err}"))
+    }
+
+    pub fn try_new(file_path: &str, srgb: bool) -> Result<Self, Box<dyn Error>> {
         if srgb {
-            let image = image::open(file_path).unwrap().into_rgb32f();
-            TextureMap { image, srgb }
+            let image = image::open(file_path)?.into_rgb32f();
+            Ok(TextureMap { image, srgb })
         } else {
-            let ext = Path::new(file_path).extension().unwrap();
+            let ext = Path::new(file_path)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default();
             if ext == "hdr" {
-                let file = std::fs::File::open(file_path).unwrap();
+                let file = std::fs::File::open(file_path)?;
                 let reader = std::io::BufReader::new(file);
-                let decoder = HdrDecoder::new(reader).unwrap();
+                let decoder = HdrDecoder::new(reader)?;
                 let metadata = decoder.metadata();
-                let pixels = decoder.read_image_hdr().unwrap();
+                let pixels = decoder.read_image_hdr()?;
                 let buffer_data = pixels
                     .par_chunks(1000)
                     .flat_map(|chunk| {
@@ -36,15 +45,15 @@ impl TextureMap {
                         buffer_data
                     })
                     .collect::<Vec<_>>();
-                let buffer =
-                    ImageBuffer::from_raw(metadata.width, metadata.height, buffer_data).unwrap();
-                TextureMap {
+                let buffer = ImageBuffer::from_raw(metadata.width, metadata.height, buffer_data)
+                    .ok_or("HDR texture dimensions do not match decoded data")?;
+                Ok(TextureMap {
                     image: buffer,
                     srgb,
-                }
+                })
             } else {
-                let image = image::open(file_path).unwrap().into_rgb32f();
-                TextureMap { image, srgb }
+                let image = image::open(file_path)?.into_rgb32f();
+                Ok(TextureMap { image, srgb })
             }
         }
     }

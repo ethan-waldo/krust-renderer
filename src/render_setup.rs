@@ -9,6 +9,7 @@ use crate::hit::{HittableList, Object};
 use crate::lights::{DirectionalLight, QuadLight};
 use crate::material::{Material, Principle};
 use crate::path_recording;
+use crate::relight_pipeline::EnvironmentSettings;
 use crate::relighting::{self, VirtualLight};
 use crate::render::{get_pixel_chunks, render_chunk};
 use crate::sphere::Sphere;
@@ -21,7 +22,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use show_image::{create_window, ImageInfo, ImageView, WindowOptions};
 use std::collections::HashMap;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::{fs, thread};
@@ -439,6 +440,9 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
     println!("Processing BVH...");
     let world_bvh = Arc::new(Object::Bvh(Bvh::new(&mut world.objects, 0.0, 1.0)));
     let relighting_settings = RelightingSettings::from_json(&data["settings"], output_dir, depth);
+    let environment_settings = environment_settings_from_json(&data["settings"]);
+    let asset_dependency_hash = asset_dependency_hash(&data, &environment_settings)
+        .unwrap_or_else(|err| panic!("Failed to hash scene asset dependencies: {err}"));
     let relight_editor_width = setting_u32(&data["settings"], "relight_editor_width", width);
     let relight_editor_height = setting_u32(
         &data["settings"],
@@ -469,6 +473,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
                 height: relight_editor_height,
                 path_spp: relighting_settings.path_spp as u32,
                 path_depth: relighting_settings.path_depth,
+                environment: environment_settings.clone(),
                 export_jsonl,
                 nrp_weights,
                 start_nrp: relight_editor_start_nrp,
@@ -528,6 +533,13 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
                         camera.as_ref(),
                         &world.objects,
                         dir_lights.as_ref(),
+                        environment_settings.map_file.as_deref().map(|path| {
+                            (
+                                path,
+                                environment_settings.intensity,
+                                environment_settings.rotation_degrees,
+                            )
+                        }),
                     )
                 };
 
@@ -704,8 +716,14 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
         }
 
         let nrp_weights = PathBuf::from(&relighting_settings.nrp_weights);
-        let should_train_nrp =
-            relighting_settings.retrain_nrp || nrp_weights_need_training(&relighting_settings);
+        let should_train_nrp = relighting_settings.retrain_nrp
+            || nrp_weights_need_training(
+                &relighting_settings,
+                width,
+                height,
+                scene_file,
+                &asset_dependency_hash,
+            );
         if should_train_nrp {
             if !relighting_settings.auto_train_nrp {
                 panic!(
@@ -762,6 +780,11 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             ) {
                 panic!("Failed to train NRP weights: {err}");
             }
+            if let Err(err) =
+                stamp_nrp_asset_hash(&relighting_settings.nrp_weights, &asset_dependency_hash)
+            {
+                panic!("Failed to stamp NRP metadata: {err}");
+            }
         } else {
             eprintln!(
                 "NRP 1/3: using existing weights at {}",
@@ -773,7 +796,9 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             "NRP 3/3: running neural relighting -> {}",
             relighting_settings.relight_output
         );
-        let export_jsonl = if relighting_settings.record_paths {
+        let export_jsonl = if relighting_settings.record_paths
+            && !PathBuf::from(&relighting_settings.relight_path).exists()
+        {
             Some(PathBuf::from(&relighting_settings.relight_path))
         } else {
             None
@@ -786,6 +811,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
             camera.as_ref(),
             &world.objects,
             dir_lights.as_ref(),
+            &environment_settings,
             export_jsonl.as_deref(),
             nrp_weights.as_path(),
             PathBuf::from(&relighting_settings.relight_output).as_path(),
@@ -832,6 +858,7 @@ pub fn render_scene(scene_file: Option<&str>, output_dir: &str) -> () {
                     height: relight_editor_height,
                     path_spp: relighting_settings.path_spp as u32,
                     path_depth: relighting_settings.path_depth,
+                    environment: environment_settings.clone(),
                     export_jsonl: None,
                     nrp_weights: Some(nrp_weights),
                     start_nrp: relight_editor_start_nrp,
@@ -1173,10 +1200,29 @@ fn write_nrp_aux_features(
     Ok(())
 }
 
-fn nrp_weights_need_training(settings: &RelightingSettings) -> bool {
+fn nrp_weights_need_training(
+    settings: &RelightingSettings,
+    width: u32,
+    height: u32,
+    scene_file: Option<&str>,
+    asset_dependency_hash: &str,
+) -> bool {
     let path = PathBuf::from(&settings.nrp_weights);
     if !path.exists() {
         return true;
+    }
+
+    if let Some(scene_file) = scene_file {
+        if let (Ok(scene_meta), Ok(weights_meta)) = (fs::metadata(scene_file), fs::metadata(&path))
+        {
+            if let (Ok(scene_modified), Ok(weights_modified)) =
+                (scene_meta.modified(), weights_meta.modified())
+            {
+                if scene_modified > weights_modified {
+                    return true;
+                }
+            }
+        }
     }
 
     let Ok(bytes) = fs::read(path) else {
@@ -1195,6 +1241,9 @@ fn nrp_weights_need_training(settings: &RelightingSettings) -> bool {
 
     let expected_input_dim = settings.nrp_hash_levels * settings.nrp_hash_features + 10 + 20;
     if read_u32(0) != expected_input_dim
+        || read_u32(1) != settings.nrp_train_hidden_dim
+        || read_u32(2) != 3
+        || read_u32(3) != settings.nrp_train_layers
         || read_u32(4) != settings.nrp_hash_table_size
         || read_u32(5) != settings.nrp_hash_levels
         || read_u32(6) != settings.nrp_hash_features
@@ -1210,8 +1259,118 @@ fn nrp_weights_need_training(settings: &RelightingSettings) -> bool {
         return true;
     };
 
-    meta["target_model"].as_str() != Some("direct_material_specular_v7")
+    let meta_u32 = |key: &str| -> Option<u32> { meta[key].as_u64().map(|value| value as u32) };
+    meta["target_model"].as_str() != Some("direct_material_specular_v8")
         || meta["hash_interpolation"].as_str() != Some("bilinear")
+        || meta_u32("width") != Some(width)
+        || meta_u32("height") != Some(height)
+        || meta_u32("hidden_dim") != Some(settings.nrp_train_hidden_dim)
+        || meta_u32("num_layers") != Some(settings.nrp_train_layers)
+        || meta_u32("hash_levels") != Some(settings.nrp_hash_levels)
+        || meta_u32("hash_features") != Some(settings.nrp_hash_features)
+        || meta_u32("hash_table_size") != Some(settings.nrp_hash_table_size)
+        || meta_u32("aux_feature_count") != Some(20)
+        || meta_u32("random_lights") != Some(settings.nrp_random_lights)
+        || meta_u32("lights_per_pixel") != Some(settings.nrp_lights_per_pixel)
+        || meta_u32("max_training_samples") != Some(settings.nrp_max_training_samples)
+        || meta_u32("target_denoise_radius") != Some(settings.nrp_target_denoise_radius)
+        || meta_u32("target_denoise_passes") != Some(settings.nrp_target_denoise_passes)
+        || meta["asset_dependency_hash"].as_str() != Some(asset_dependency_hash)
+}
+
+fn stamp_nrp_asset_hash(
+    weights_path: &str,
+    asset_dependency_hash: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let meta_path = PathBuf::from(weights_path).with_extension("json");
+    let mut meta: serde_json::Value = serde_json::from_str(&fs::read_to_string(&meta_path)?)?;
+    meta["asset_dependency_hash"] = serde_json::Value::String(asset_dependency_hash.to_string());
+    fs::write(
+        meta_path,
+        format!("{}\n", serde_json::to_string_pretty(&meta)?),
+    )?;
+    Ok(())
+}
+
+fn asset_dependency_hash(
+    scene: &serde_json::Value,
+    environment: &EnvironmentSettings,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut paths = Vec::new();
+    collect_asset_paths(scene, &mut paths);
+    if let Some(path) = &environment.map_file {
+        paths.push(path.clone());
+    }
+    paths.sort();
+    paths.dedup();
+
+    let mut hash = Fnv64::new();
+    for path in paths {
+        if path.is_empty() || path == "None" || path == "none" || path == "null" {
+            continue;
+        }
+        let path = Path::new(&path);
+        if !path.exists() {
+            continue;
+        }
+        let path_text = path.to_string_lossy();
+        hash.update(path_text.as_bytes());
+        hash.update(&[0]);
+        hash.update(&fs::read(path)?);
+        hash.update(&[0xff]);
+    }
+
+    Ok(format!("{:016x}", hash.finish()))
+}
+
+fn collect_asset_paths(value: &serde_json::Value, paths: &mut Vec<String>) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if let Some(path) = value.as_str() {
+                    let key = key.to_ascii_lowercase();
+                    if key.contains("_tex")
+                        || key.contains("texture")
+                        || key == "environment_map_file"
+                        || key == "hdri_file"
+                        || key == "skydome_texture"
+                    {
+                        paths.push(path.to_string());
+                    }
+                }
+                collect_asset_paths(value, paths);
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                collect_asset_paths(value, paths);
+            }
+        }
+        _ => {}
+    }
+}
+
+struct Fnv64 {
+    value: u64,
+}
+
+impl Fnv64 {
+    fn new() -> Self {
+        Self {
+            value: 0xcbf29ce484222325,
+        }
+    }
+
+    fn update(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            self.value ^= *byte as u64;
+            self.value = self.value.wrapping_mul(0x100000001b3);
+        }
+    }
+
+    fn finish(&self) -> u64 {
+        self.value
+    }
 }
 
 fn write_virtual_lights_file(path: &str, lights: &[VirtualLight]) -> std::io::Result<()> {
@@ -1283,6 +1442,24 @@ fn setting_u32(settings: &serde_json::Value, key: &str, default: u32) -> u32 {
 
 fn setting_f64(settings: &serde_json::Value, key: &str, default: f64) -> f64 {
     settings[key].as_f64().unwrap_or(default)
+}
+
+fn environment_settings_from_json(settings: &serde_json::Value) -> EnvironmentSettings {
+    let map_file = setting_string(settings, "environment_map_file")
+        .or_else(|| setting_string(settings, "hdri_file"))
+        .or_else(|| setting_string(settings, "skydome_texture"))
+        .filter(|path| !path.is_empty());
+    let intensity = setting_f64(settings, "environment_intensity", 1.0) as f32;
+    let rotation_degrees = setting_f64(settings, "environment_rotation_degrees", 0.0) as f32;
+    if map_file.is_some() {
+        EnvironmentSettings {
+            map_file,
+            intensity,
+            rotation_degrees,
+        }
+    } else {
+        EnvironmentSettings::disabled()
+    }
 }
 
 fn output_path(output_dir: &str, file_name: &str) -> String {

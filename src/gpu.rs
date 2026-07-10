@@ -33,6 +33,7 @@ struct GpuParams {
     counts: [u32; 4],
     render: [u32; 4],
     chunk: [u32; 4],
+    environment: [f32; 4],
 }
 
 unsafe impl bytemuck::Zeroable for GpuParams {}
@@ -225,6 +226,17 @@ struct GpuTexel {
 unsafe impl bytemuck::Zeroable for GpuTexel {}
 unsafe impl bytemuck::Pod for GpuTexel {}
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct GpuEnvironmentSample {
+    cdf_pdf: [f32; 4],
+    direction: [f32; 4],
+    radiance: [f32; 4],
+}
+
+unsafe impl bytemuck::Zeroable for GpuEnvironmentSample {}
+unsafe impl bytemuck::Pod for GpuEnvironmentSample {}
+
 struct GpuScene {
     materials: Vec<GpuMaterial>,
     spheres: Vec<GpuSphere>,
@@ -233,6 +245,11 @@ struct GpuScene {
     quad_lights: Vec<GpuQuadLight>,
     textures: Vec<GpuTextureInfo>,
     texels: Vec<GpuTexel>,
+    environment_texture: u32,
+    environment_intensity: f32,
+    environment_rotation_degrees: f32,
+    environment_sample_offset: u32,
+    environment_sample_count: u32,
 }
 
 pub fn scene_support_report(
@@ -266,7 +283,7 @@ pub fn render_first_hit_aovs(
     objects: &[Arc<Object>],
     directional_lights: &[DirectionalLight],
 ) -> Result<FrameBuffers, Box<dyn Error>> {
-    let scene = GpuScene::from_objects(objects, directional_lights);
+    let scene = GpuScene::from_objects(objects, directional_lights, None)?;
     let pixels = block_on(run_shader(
         width,
         height,
@@ -288,8 +305,9 @@ pub fn render_path_trace(
     camera: &Camera,
     objects: &[Arc<Object>],
     directional_lights: &[DirectionalLight],
+    environment: Option<(&str, f32, f32)>,
 ) -> Result<FrameBuffers, Box<dyn Error>> {
-    let scene = GpuScene::from_objects(objects, directional_lights);
+    let scene = GpuScene::from_objects(objects, directional_lights, environment)?;
     let pixels = block_on(run_shader(
         width,
         height,
@@ -361,7 +379,7 @@ pub fn record_scene_paths_gpu_resident(
     objects: &[Arc<Object>],
     directional_lights: &[DirectionalLight],
 ) -> Result<GpuPathCache, Box<dyn Error>> {
-    let scene = GpuScene::from_objects(objects, directional_lights);
+    let scene = GpuScene::from_objects(objects, directional_lights, None)?;
     block_on(run_path_record_shader_resident(
         width,
         height,
@@ -380,7 +398,11 @@ pub fn write_path_records_from_vertices(
 }
 
 impl GpuScene {
-    fn from_objects(objects: &[Arc<Object>], directional_lights: &[DirectionalLight]) -> Self {
+    fn from_objects(
+        objects: &[Arc<Object>],
+        directional_lights: &[DirectionalLight],
+        environment: Option<(&str, f32, f32)>,
+    ) -> Result<Self, Box<dyn Error>> {
         let mut scene = Self {
             materials: Vec::new(),
             spheres: Vec::new(),
@@ -394,12 +416,46 @@ impl GpuScene {
             texels: vec![GpuTexel {
                 value: [0.0, 0.0, 0.0, 1.0],
             }],
+            environment_texture: 0,
+            environment_intensity: 0.0,
+            environment_rotation_degrees: 0.0,
+            environment_sample_offset: 0,
+            environment_sample_count: 0,
         };
         let mut material_ids = HashMap::new();
         let mut texture_ids = HashMap::new();
 
         for object in objects {
             scene.push_object(object, &mut material_ids, &mut texture_ids);
+        }
+
+        if let Some((path, intensity, _rotation_degrees)) = environment {
+            if intensity > 0.0 && !path.is_empty() {
+                if !Path::new(path).exists() {
+                    return Err(format!("environment map does not exist: {path}").into());
+                }
+                let map = TextureMap::try_new(path, false)
+                    .map_err(|err| format!("failed to load environment map {path}: {err}"))?;
+                let environment_samples =
+                    build_environment_samples(&map, intensity, _rotation_degrees);
+                scene.environment_sample_offset = scene.texels.len() as u32;
+                scene.environment_sample_count = environment_samples.len() as u32;
+                for sample in environment_samples {
+                    scene.texels.push(GpuTexel {
+                        value: sample.cdf_pdf,
+                    });
+                    scene.texels.push(GpuTexel {
+                        value: sample.direction,
+                    });
+                    scene.texels.push(GpuTexel {
+                        value: sample.radiance,
+                    });
+                }
+                scene.environment_texture =
+                    push_texture(&map, &mut scene.textures, &mut scene.texels);
+                scene.environment_intensity = intensity;
+                scene.environment_rotation_degrees = _rotation_degrees;
+            }
         }
 
         if scene.materials.is_empty() {
@@ -418,7 +474,7 @@ impl GpuScene {
             scene.quad_lights.push(GpuQuadLight::empty());
         }
 
-        scene
+        Ok(scene)
     }
 
     fn push_object(
@@ -589,6 +645,16 @@ fn texture_id(
         return *id;
     }
 
+    let id = push_texture(texture, textures, texels);
+    texture_ids.insert(key, id);
+    id
+}
+
+fn push_texture(
+    texture: &TextureMap,
+    textures: &mut Vec<GpuTextureInfo>,
+    texels: &mut Vec<GpuTexel>,
+) -> u32 {
     let (width, height) = texture.image.dimensions();
     let offset = texels.len() as u32;
     for y in 0..height {
@@ -603,7 +669,6 @@ fn texture_id(
     textures.push(GpuTextureInfo {
         offset_width: [offset, width, height, 1],
     });
-    texture_ids.insert(key, id);
     id
 }
 
@@ -613,6 +678,96 @@ impl GpuTextureInfo {
             offset_width: [0, 1, 1, 0],
         }
     }
+}
+
+impl GpuEnvironmentSample {
+    fn empty() -> Self {
+        Self {
+            cdf_pdf: [1.0, 0.0, 0.0, 0.0],
+            direction: [0.0, 1.0, 0.0, 0.0],
+            radiance: [0.0, 0.0, 0.0, 0.0],
+        }
+    }
+}
+
+fn build_environment_samples(
+    texture: &TextureMap,
+    intensity: f32,
+    rotation_degrees: f32,
+) -> Vec<GpuEnvironmentSample> {
+    let (width, height) = texture.image.dimensions();
+    if width == 0 || height == 0 || intensity <= 0.0 {
+        return vec![GpuEnvironmentSample::empty()];
+    }
+
+    let mut weights = Vec::with_capacity((width * height) as usize);
+    let mut total = 0.0f32;
+    for y in 0..height {
+        let v = (y as f32 + 0.5) / height as f32;
+        let theta = (1.0 - v) * std::f32::consts::PI - std::f32::consts::FRAC_PI_2;
+        let sin_theta = theta.cos().max(0.000001);
+        for x in 0..width {
+            let color = texture.sample_pixel(x, y);
+            let luminance = (0.2126 * color.r + 0.7152 * color.g + 0.0722 * color.b) as f32;
+            let weight = luminance.max(0.0) * sin_theta;
+            weights.push(weight);
+            total += weight;
+        }
+    }
+
+    if total <= 0.0 {
+        return vec![GpuEnvironmentSample::empty()];
+    }
+
+    let texel_solid_angle_base =
+        (2.0 * std::f32::consts::PI / width as f32) * (std::f32::consts::PI / height as f32);
+    let rotation = rotation_degrees.to_radians();
+    let mut cdf = 0.0f32;
+    let mut samples = Vec::with_capacity(weights.len());
+    for y in 0..height {
+        let v = (y as f32 + 0.5) / height as f32;
+        let theta = (1.0 - v) * std::f32::consts::PI - std::f32::consts::FRAC_PI_2;
+        let sin_theta = theta.cos().max(0.000001);
+        let texel_solid_angle = texel_solid_angle_base * sin_theta;
+        for x in 0..width {
+            let index = (y * width + x) as usize;
+            let probability = weights[index] / total;
+            cdf = (cdf + probability).min(1.0);
+            let u = (x as f32 + 0.5) / width as f32;
+            let phi = (1.0 - u) * 2.0 * std::f32::consts::PI - std::f32::consts::PI - rotation;
+            let cos_theta = theta.cos();
+            let direction = Vec3::new(
+                (cos_theta * phi.cos()) as f64,
+                (-theta.sin()) as f64,
+                (cos_theta * phi.sin()) as f64,
+            )
+            .normalize();
+            let color = texture.sample_pixel(x, y);
+            samples.push(GpuEnvironmentSample {
+                cdf_pdf: [
+                    cdf,
+                    if texel_solid_angle > 0.0 {
+                        probability / texel_solid_angle
+                    } else {
+                        0.0
+                    },
+                    0.0,
+                    0.0,
+                ],
+                direction: vec4(direction, 0.0),
+                radiance: [
+                    color.r as f32 * intensity,
+                    color.g as f32 * intensity,
+                    color.b as f32 * intensity,
+                    1.0,
+                ],
+            });
+        }
+    }
+    if let Some(last) = samples.last_mut() {
+        last.cdf_pdf[0] = 1.0;
+    }
+    samples
 }
 
 impl GpuSphere {
@@ -754,7 +909,18 @@ async fn run_shader(
             scene.directional_lights.len() as u32,
             scene.quad_lights.len() as u32,
         ],
-        chunk: [0, 0, 0, 0],
+        chunk: [
+            scene.environment_texture,
+            if scene.environment_texture != 0 { 1 } else { 0 },
+            scene.environment_sample_offset,
+            scene.environment_sample_count,
+        ],
+        environment: [
+            scene.environment_intensity,
+            scene.environment_rotation_degrees.to_radians(),
+            0.0,
+            0.0,
+        ],
     };
 
     let params_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -797,7 +963,6 @@ async fn run_shader(
         contents: bytemuck::cast_slice(&scene.quad_lights),
         usage: wgpu::BufferUsages::STORAGE,
     });
-
     let output_size = width as u64 * height as u64 * size_of::<GpuPixel>() as u64;
     let output_buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("krust gpu output"),
@@ -968,6 +1133,7 @@ async fn run_path_record_shader_resident(
         // chunk = [chunk_spp, sample_offset, sample_count, chunk_count];
         // sample_offset / sample_count are filled in per dispatch below.
         chunk: [chunk_spp as u32, 0, 0, PATH_CHUNK_COUNT as u32],
+        environment: [0.0, 0.0, 0.0, 0.0],
     };
 
     let materials_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1538,6 +1704,8 @@ struct Params {
     vertical: vec4<f32>,
     counts: vec4<u32>,
     render: vec4<u32>,
+    chunk: vec4<u32>,
+    environment: vec4<f32>,
 };
 
 struct Material {
@@ -1624,7 +1792,6 @@ struct Hit {
 @group(0) @binding(6) var<storage, read> texels: array<Texel>;
 @group(0) @binding(7) var<storage, read> directional_lights: array<DirectionalLight>;
 @group(0) @binding(8) var<storage, read> quad_lights: array<QuadLight>;
-
 fn empty_lobes() -> Lobes {
     var lobes: Lobes;
     lobes.rgba = vec4<f32>(0.0);
@@ -1904,6 +2071,8 @@ struct Params {
     vertical: vec4<f32>,
     counts: vec4<u32>,
     render: vec4<u32>,
+    chunk: vec4<u32>,
+    environment: vec4<f32>,
 };
 
 struct Material {
@@ -1990,7 +2159,6 @@ struct Hit {
 @group(0) @binding(6) var<storage, read> texels: array<Texel>;
 @group(0) @binding(7) var<storage, read> directional_lights: array<DirectionalLight>;
 @group(0) @binding(8) var<storage, read> quad_lights: array<QuadLight>;
-
 fn empty_lobes() -> Lobes {
     var lobes: Lobes;
     lobes.rgba = vec4<f32>(0.0);
@@ -2250,8 +2418,8 @@ fn direct_directional(
         }
         let ndl = max(dot(normal, l), 0.0);
         let h = normalize(l + view_dir);
-        let spec_power = max(2.0, (1.0 - clamp(roughness, 0.0, 1.0)) * 128.0);
-        let spec_term = pow(max(dot(normal, h), 0.0), spec_power);
+        let spec_power = pow(1.0 - clamp(roughness, 0.0, 1.0), 4.0) * 1000.0 + 3.5;
+        let spec_term = pow(max(dot(normal, h), 0.0), spec_power) * ndl;
         result = result + (albedo * ndl + specular * spec_term) * light.color.rgb;
     }
     return result;
@@ -2284,12 +2452,65 @@ fn direct_quad(
         }
         let ndl = max(dot(normal, l), 0.0);
         let h = normalize(l + view_dir);
-        let spec_power = max(2.0, (1.0 - clamp(roughness, 0.0, 1.0)) * 128.0);
-        let spec_term = pow(max(dot(normal, h), 0.0), spec_power);
+        let spec_power = pow(1.0 - clamp(roughness, 0.0, 1.0), 4.0) * 1000.0 + 3.5;
+        let spec_term = pow(max(dot(normal, h), 0.0), spec_power) * ndl;
         let area = light.position.w;
         result = result + (albedo * ndl + specular * spec_term) * light.color.rgb * area / distance2;
     }
     return result;
+}
+
+fn direct_environment(
+    position: vec3<f32>,
+    normal: vec3<f32>,
+    view_dir: vec3<f32>,
+    albedo: vec3<f32>,
+    specular: vec3<f32>,
+    roughness: f32,
+    state: ptr<function, u32>,
+) -> vec3<f32> {
+    let sample_count = params.chunk.w;
+    if (sample_count == 0u || params.environment.x <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+
+    let xi = next_rand(state);
+    var lo = 0u;
+    var hi = sample_count - 1u;
+    for (var step = 0u; step < 24u; step = step + 1u) {
+        if (lo >= hi) {
+            break;
+        }
+        let mid = (lo + hi) / 2u;
+        let mid_cdf = texels[params.chunk.z + mid * 3u].value.x;
+        if (xi <= mid_cdf) {
+            hi = mid;
+        } else {
+            lo = mid + 1u;
+        }
+    }
+
+    let sample_base = params.chunk.z + lo * 3u;
+    let cdf_pdf = texels[sample_base].value;
+    let sample_direction = texels[sample_base + 1u].value;
+    let sample_radiance = texels[sample_base + 2u].value;
+    let l = normalize(sample_direction.xyz);
+    let ndl = max(dot(normal, l), 0.0);
+    if (ndl <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let shadow = closest_hit(position + normal * 0.0001, l);
+    if (shadow.hit) {
+        return vec3<f32>(0.0);
+    }
+
+    let pdf = max(cdf_pdf.y, 0.000001);
+    let h = normalize(l + view_dir);
+    let spec_power = pow(1.0 - clamp(roughness, 0.0, 1.0), 4.0) * 1000.0 + 3.5;
+    let spec_norm = (spec_power + 2.0) * 0.15915494309;
+    let spec_term = spec_norm * pow(max(dot(normal, h), 0.0), spec_power) * ndl;
+    let diffuse_term = albedo * ndl * 0.31830988618;
+    return (diffuse_term + specular * spec_term) * sample_radiance.rgb / pdf;
 }
 
 fn sample_texture(texture_id: u32, uv: vec2<f32>, fallback: vec4<f32>) -> vec4<f32> {
@@ -2309,6 +2530,54 @@ fn sample_texture(texture_id: u32, uv: vec2<f32>, fallback: vec4<f32>) -> vec4<f
     return texels[info.x + y * width + x].value;
 }
 
+fn texture_texel(texture_id: u32, x: i32, y: i32) -> vec4<f32> {
+    let info = texture_infos[texture_id].offset_width;
+    let width = i32(info.y);
+    let height = i32(info.z);
+    if (texture_id == 0u || info.w == 0u || width <= 0 || height <= 0) {
+        return vec4<f32>(0.0);
+    }
+    let wrapped_x = ((x % width) + width) % width;
+    let clamped_y = clamp(y, 0, height - 1);
+    return texels[info.x + u32(clamped_y) * info.y + u32(wrapped_x)].value;
+}
+
+fn sample_texture_linear(texture_id: u32, uv: vec2<f32>, fallback: vec4<f32>) -> vec4<f32> {
+    if (texture_id == 0u) {
+        return fallback;
+    }
+    let info = texture_infos[texture_id].offset_width;
+    if (info.w == 0u || info.y == 0u || info.z == 0u) {
+        return fallback;
+    }
+    let coord = vec2<f32>(fract(uv.x) * f32(info.y) - 0.5, fract(uv.y) * f32(info.z) - 0.5);
+    let base = vec2<i32>(i32(floor(coord.x)), i32(floor(coord.y)));
+    let frac = coord - vec2<f32>(base);
+    let c00 = texture_texel(texture_id, base.x, base.y);
+    let c10 = texture_texel(texture_id, base.x + 1, base.y);
+    let c01 = texture_texel(texture_id, base.x, base.y + 1);
+    let c11 = texture_texel(texture_id, base.x + 1, base.y + 1);
+    return mix(mix(c00, c10, frac.x), mix(c01, c11, frac.x), frac.y);
+}
+
+fn environment_uv(direction: vec3<f32>) -> vec2<f32> {
+    let dir = normalize(direction);
+    let phi = atan2(dir.z, dir.x) + params.environment.y;
+    let theta = asin(clamp(-dir.y, -1.0, 1.0));
+    return vec2<f32>(
+        fract(1.0 - (phi + 3.14159265359) / 6.28318530718),
+        clamp(1.0 - (theta + 1.57079632679) / 3.14159265359, 0.0, 1.0)
+    );
+}
+
+fn environment_radiance(direction: vec3<f32>) -> vec3<f32> {
+    if (params.chunk.y == 0u || params.environment.x <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    return sample_texture_linear(params.chunk.x, environment_uv(direction), vec4<f32>(0.0)).rgb
+        * params.environment.x;
+}
+
 fn tangent_basis(normal: vec3<f32>) -> mat3x3<f32> {
     var up = vec3<f32>(0.0, 1.0, 0.0);
     if (abs(normal.y) > 0.999) {
@@ -2317,6 +2586,21 @@ fn tangent_basis(normal: vec3<f32>) -> mat3x3<f32> {
     let tangent = normalize(cross(up, normal));
     let bitangent = cross(normal, tangent);
     return mat3x3<f32>(tangent, bitangent, normal);
+}
+
+fn ggx_sample(roughness: f32, normal: vec3<f32>, state: ptr<function, u32>) -> vec3<f32> {
+    let u = next_rand(state);
+    let v = next_rand(state);
+    let basis = tangent_basis(normal);
+    let a2 = roughness * roughness;
+    let cos_theta = sqrt(max(0.0, (1.0 - u) / ((a2 - 1.0) * u + 1.0)));
+    let sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    let phi = v * 6.28318530718;
+    return normalize(
+        basis[0] * (sin_theta * cos(phi))
+            + basis[1] * (sin_theta * sin(phi))
+            + normal * cos_theta
+    );
 }
 
 fn perturb_normal(material: Material, uv: vec2<f32>, normal: vec3<f32>) -> vec3<f32> {
@@ -2364,6 +2648,17 @@ fn trace_sample(pixel: vec2<u32>, sample_index: u32) -> Lobes {
     for (var bounce = 0u; bounce < params.render.y; bounce = bounce + 1u) {
         let hit = closest_hit(ray_origin, ray_dir);
         if (!hit.hit) {
+            let environment = throughput * environment_radiance(ray_dir);
+            if (environment.r + environment.g + environment.b > 0.0) {
+                path_lobes.rgba = path_lobes.rgba + vec4<f32>(environment, 1.0);
+                if (first_lobe == 1u) {
+                    path_lobes.diffuse = path_lobes.diffuse + vec4<f32>(environment, 1.0);
+                } else if (first_lobe == 2u) {
+                    path_lobes.specular = path_lobes.specular + vec4<f32>(environment, 1.0);
+                } else {
+                    path_lobes.emission = path_lobes.emission + vec4<f32>(environment, 1.0);
+                }
+            }
             break;
         }
 
@@ -2442,12 +2737,13 @@ fn trace_sample(pixel: vec2<u32>, sample_index: u32) -> Lobes {
         let diffuse_weight = max(diffuse_weight_tex.r - metallic - refraction, 0.0);
         let specular_weight = max(specular_weight_tex.r, 0.0);
         let specular_prob = specular_weight / max(diffuse_weight + specular_weight, 0.0001);
+        let f0 = mix(specular.rgb * (0.04 * specular_weight), albedo.rgb, clamp(metallic, 0.0, 1.0));
         let direct = direct_directional(
             hit.position,
             surface_normal,
             normalize(-ray_dir),
             albedo.rgb * diffuse_weight,
-            specular.rgb * specular_weight,
+            f0,
             roughness_tex.r,
             &rng,
         ) + direct_quad(
@@ -2455,7 +2751,15 @@ fn trace_sample(pixel: vec2<u32>, sample_index: u32) -> Lobes {
             surface_normal,
             normalize(-ray_dir),
             albedo.rgb * diffuse_weight,
-            specular.rgb * specular_weight,
+            f0,
+            roughness_tex.r,
+            &rng,
+        ) + direct_environment(
+            hit.position,
+            surface_normal,
+            normalize(-ray_dir),
+            albedo.rgb * diffuse_weight,
+            f0,
             roughness_tex.r,
             &rng,
         );
@@ -2479,7 +2783,13 @@ fn trace_sample(pixel: vec2<u32>, sample_index: u32) -> Lobes {
             }
         } else if (metallic > roll || roll < specular_prob) {
             let roughness = max(roughness_tex.r, 0.001);
-            ray_dir = normalize(reflect_dir(ray_dir, surface_normal) + random_unit(&rng) * roughness);
+            let incoming_dir = ray_dir;
+            let view_dir = normalize(-ray_dir);
+            let half_dir = ggx_sample(roughness, surface_normal, &rng);
+            ray_dir = normalize(2.0 * dot(view_dir, half_dir) * half_dir - view_dir);
+            if (dot(ray_dir, surface_normal) <= 0.0) {
+                ray_dir = reflect_dir(incoming_dir, surface_normal);
+            }
             if (metallic > roll) {
                 throughput = throughput * albedo.rgb;
             } else {
@@ -2554,6 +2864,7 @@ struct Params {
     counts: vec4<u32>,
     render: vec4<u32>,
     chunk: vec4<u32>,
+    environment: vec4<f32>,
 };
 
 struct Material {
@@ -2837,6 +3148,43 @@ fn sample_texture(texture_id: u32, uv: vec2<f32>, fallback: vec4<f32>) -> vec4<f
     return texels[info.x + y * width + x].value;
 }
 
+fn tangent_basis(normal: vec3<f32>) -> mat3x3<f32> {
+    var up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(normal.y) > 0.999) {
+        up = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let tangent = normalize(cross(up, normal));
+    let bitangent = cross(normal, tangent);
+    return mat3x3<f32>(tangent, bitangent, normal);
+}
+
+fn perturb_normal(material: Material, uv: vec2<f32>, normal: vec3<f32>) -> vec3<f32> {
+    var n = normal;
+    let bump_id = material.textures2.x;
+    if (bump_id != 0u || material.params2.z != 0.0) {
+        let bump = sample_texture(
+            bump_id,
+            uv,
+            vec4<f32>(
+                material.params2.z,
+                material.params2.z,
+                material.params2.z,
+                material.params2.z,
+            ),
+        );
+        let dx = sample_texture(bump_id, uv + vec2<f32>(0.001, 0.0), bump).r - bump.r;
+        let dy = sample_texture(bump_id, uv + vec2<f32>(0.0, 0.001), bump).r - bump.r;
+        let basis = tangent_basis(n);
+        n = normalize(n + basis[0] * dx * material.params2.w * 10.0 + basis[1] * dy * material.params2.w * 10.0);
+    }
+    let normal_id = material.textures2.y;
+    if (normal_id != 0u) {
+        let normal_tex = sample_texture(normal_id, uv, vec4<f32>(0.5, 0.5, 1.0, 1.0)).rgb * 2.0 - vec3<f32>(1.0);
+        n = normalize(tangent_basis(n) * normal_tex);
+    }
+    return n;
+}
+
 fn random_unit(state: ptr<function, u32>) -> vec3<f32> {
     let z = next_rand(state) * 2.0 - 1.0;
     let a = next_rand(state) * 6.28318530718;
@@ -2859,6 +3207,21 @@ fn cosine_direction(normal: vec3<f32>, state: ptr<function, u32>) -> vec3<f32> {
     let tangent = normalize(cross(up, normal));
     let bitangent = cross(normal, tangent);
     return normalize(tangent * x + bitangent * y + normal * z);
+}
+
+fn ggx_sample(roughness: f32, normal: vec3<f32>, state: ptr<function, u32>) -> vec3<f32> {
+    let u = next_rand(state);
+    let v = next_rand(state);
+    let basis = tangent_basis(normal);
+    let a2 = roughness * roughness;
+    let cos_theta = sqrt(max(0.0, (1.0 - u) / ((a2 - 1.0) * u + 1.0)));
+    let sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    let phi = v * 6.28318530718;
+    return normalize(
+        basis[0] * (sin_theta * cos(phi))
+            + basis[1] * (sin_theta * sin(phi))
+            + normal * cos_theta
+    );
 }
 
 fn reflect_dir(v: vec3<f32>, n: vec3<f32>) -> vec3<f32> {
@@ -2948,7 +3311,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     material.params.x,
                 ),
             ).r;
-            let diffuse_weight = max(sample_texture(
+            let diffuse_weight_base = sample_texture(
                 material.textures0.y,
                 hit.uv,
                 vec4<f32>(
@@ -2957,7 +3320,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     material.params.y,
                     material.params.y,
                 ),
-            ).r - material.params2.x - material.params2.y, 0.0);
+            ).r;
             let specular_weight = max(sample_texture(
                 material.textures0.w,
                 hit.uv,
@@ -2988,24 +3351,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                     material.params2.y,
                 ),
             ).r, 0.0);
+            let diffuse_weight = max(diffuse_weight_base - metallic - refraction, 0.0);
+            let surface_normal = perturb_normal(material, hit.uv, hit.normal);
             let roll = next_rand(&rng);
 
             var next_dir: vec3<f32>;
             var attenuation: vec3<f32>;
             if (refraction > roll * 2.0) {
-                next_dir = normalize(refract_dir(ray_dir, hit.normal, 1.0 / 1.5) + random_unit(&rng) * roughness);
+                next_dir = normalize(refract_dir(ray_dir, surface_normal, 1.0 / 1.5) + random_unit(&rng) * roughness);
                 attenuation = vec3<f32>(1.0);
             } else {
                 let specular_prob = specular_weight / max(diffuse_weight + specular_weight, 0.0001);
                 if (metallic > roll || specular_prob > roll) {
-                    next_dir = normalize(reflect_dir(ray_dir, hit.normal) + random_unit(&rng) * max(roughness, 0.001));
+                    let view_dir = normalize(-ray_dir);
+                    let half_dir = ggx_sample(max(roughness, 0.001), surface_normal, &rng);
+                    next_dir = normalize(2.0 * dot(view_dir, half_dir) * half_dir - view_dir);
+                    if (dot(next_dir, surface_normal) <= 0.0) {
+                        next_dir = reflect_dir(ray_dir, surface_normal);
+                    }
                     if (metallic > roll) {
                         attenuation = albedo.rgb;
                     } else {
                         attenuation = specular.rgb;
                     }
                 } else {
-                    next_dir = cosine_direction(hit.normal, &rng);
+                    next_dir = cosine_direction(surface_normal, &rng);
                     attenuation = albedo.rgb * diffuse_weight;
                 }
             }
@@ -3016,7 +3386,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
                 break;
             }
             throughput = throughput * attenuation;
-            ray_origin = hit.position + hit.normal * 0.0001;
+            ray_origin = hit.position + surface_normal * 0.0001;
             ray_dir = next_dir;
         }
     }

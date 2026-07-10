@@ -4,7 +4,7 @@ use crate::camera::Camera;
 use crate::color::Color;
 use crate::hit::Object;
 use crate::lights::DirectionalLight;
-use crate::relight_pipeline::{EditorLight, EditorLightType, RelightPipeline};
+use crate::relight_pipeline::{EditorLight, EditorLightType, EnvironmentSettings, RelightPipeline};
 use crate::relighting::VirtualLight;
 use crate::vec3::Vec3;
 use std::error::Error;
@@ -21,6 +21,7 @@ pub struct RelightEditorSettings {
     pub height: u32,
     pub path_spp: u32,
     pub path_depth: u32,
+    pub environment: EnvironmentSettings,
     pub export_jsonl: Option<PathBuf>,
     pub nrp_weights: Option<PathBuf>,
     pub start_nrp: bool,
@@ -42,6 +43,7 @@ pub fn run(
         camera.as_ref(),
         objects.as_ref(),
         directional_lights.as_ref(),
+        &settings.environment,
         settings.export_jsonl.as_deref(),
     )?;
 
@@ -111,7 +113,10 @@ pub fn run(
 
         match event {
             Event::WindowEvent { event, window_id } if window_id == window.id() => match event {
-                WindowEvent::CloseRequested => *control_flow = ControlFlow::Exit,
+                WindowEvent::CloseRequested => {
+                    save_editor_snapshot(&pipeline, &lights, use_nrp, &output_dir);
+                    *control_flow = ControlFlow::Exit;
+                }
                 WindowEvent::Resized(size) => {
                     surface_config =
                         pipeline.configure_surface(&surface, size.width.max(1), size.height.max(1));
@@ -141,6 +146,7 @@ pub fn run(
                 WindowEvent::KeyboardInput { input, .. } => {
                     if input.state == ElementState::Pressed {
                         if input.virtual_keycode == Some(VirtualKeyCode::Escape) {
+                            save_editor_snapshot(&pipeline, &lights, use_nrp, &output_dir);
                             *control_flow = ControlFlow::Exit;
                             return;
                         }
@@ -394,4 +400,25 @@ fn export_lights(path: &Path, lights: &[EditorLight]) -> std::io::Result<()> {
     let json = serde_json::json!({ "virtual_lights": payload });
     std::fs::write(path, serde_json::to_string_pretty(&json)?)?;
     Ok(())
+}
+
+fn save_editor_snapshot(
+    pipeline: &RelightPipeline,
+    lights: &[EditorLight],
+    use_nrp: bool,
+    output_dir: &Path,
+) {
+    pipeline.gather_and_tonemap(lights, use_nrp);
+
+    let image_path = output_dir.join("relight_editor_last.png");
+    match pipeline.save_ldr_png(&image_path) {
+        Ok(()) => eprintln!("saved editor frame to {}", image_path.display()),
+        Err(err) => eprintln!("failed to save editor frame: {err}"),
+    }
+
+    let lights_path = output_dir.join("relight_editor_lights.json");
+    match export_lights(&lights_path, lights) {
+        Ok(()) => eprintln!("saved editor lights to {}", lights_path.display()),
+        Err(err) => eprintln!("failed to save editor lights: {err}"),
+    }
 }

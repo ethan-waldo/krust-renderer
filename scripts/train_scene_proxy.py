@@ -303,8 +303,6 @@ def direct_light_target(aux_pixel: np.ndarray, light: dict) -> np.ndarray:
     dist2 = max(float(np.dot(light_vec, light_vec)), 1e-4)
     light_dir = light_vec / math.sqrt(dist2)
     ndotl = max(float(np.dot(normal, light_dir)), 0.0)
-    if ndotl <= 0.0:
-        return np.zeros(3, dtype=np.float32)
 
     if aux_pixel.shape[0] >= 17:
         view_dir = aux_pixel[14:17].astype(np.float32)
@@ -317,16 +315,18 @@ def direct_light_target(aux_pixel: np.ndarray, light: dict) -> np.ndarray:
     else:
         view_len = max(float(np.linalg.norm(position)), 1e-4)
         view_dir = -position / view_len
+    if ndotl <= 0.0:
+        return np.zeros(3, dtype=np.float32)
+
     half_dir = light_dir + view_dir
     half_len = max(float(np.linalg.norm(half_dir)), 1e-4)
     half_dir = half_dir / half_len
     spec_power = ((1.0 - roughness) ** 4.0) * 1000.0 + 3.5
-    spec_color = (1.0 - metallic) * specular_color + metallic * albedo
-    specular = (
-        spec_color
-        * specular_weight
-        * (max(float(np.dot(normal, half_dir)), 0.0) ** spec_power)
-    )
+    dielectric_f0 = np.clip(specular_color, 0.0, 1.0) * (0.04 * specular_weight)
+    f0 = (1.0 - metallic) * dielectric_f0 + metallic * albedo
+    hv = max(float(np.dot(half_dir, view_dir)), 0.0)
+    fresnel = f0 + (1.0 - f0) * ((1.0 - min(hv, 1.0)) ** 5.0)
+    specular = fresnel * (max(float(np.dot(normal, half_dir)), 0.0) ** spec_power) * ndotl
     diffuse = albedo * diffuse_weight * ndotl
 
     color = np.array(light.get("color", [1.0, 1.0, 1.0]), dtype=np.float32)
@@ -610,10 +610,12 @@ def main() -> None:
                 "height": height,
                 "lights": lights,
                 "training_light_count": len(training_lights),
+                "random_lights": args.random_lights,
                 "lights_per_pixel": args.lights_per_pixel,
+                "max_training_samples": args.max_training_samples,
                 "aux_feature_count": 20 if aux is not None else 0,
                 "target_space": "log1p_radiance",
-                "target_model": "direct_material_specular_v7" if aux is not None and aux.shape[2] >= 20 else "segment_gather_denoised_v3",
+                "target_model": "direct_material_specular_v8" if aux is not None and aux.shape[2] >= 20 else "segment_gather_denoised_v3",
                 "hash_interpolation": "bilinear",
                 "target_denoise_radius": args.target_denoise_radius,
                 "target_denoise_passes": args.target_denoise_passes,

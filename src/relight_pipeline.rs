@@ -8,6 +8,7 @@ use crate::gpu::{self, GpuPathCache};
 use crate::hit::Object;
 use crate::lights::DirectionalLight;
 use crate::relighting::VirtualLight;
+use crate::texture::TextureMap;
 use crate::vec3::Vec3;
 use std::error::Error;
 use std::path::Path;
@@ -88,6 +89,7 @@ struct GatherParams {
     chunk_spp: u32,
     _pad: u32,
     camera_origin: [f32; 4],
+    environment: [f32; 4],
 }
 
 unsafe impl bytemuck::Pod for GatherParams {}
@@ -104,6 +106,27 @@ struct BlitParams {
 
 unsafe impl bytemuck::Pod for BlitParams {}
 unsafe impl bytemuck::Zeroable for BlitParams {}
+
+#[derive(Clone, Debug)]
+pub struct EnvironmentSettings {
+    pub map_file: Option<String>,
+    pub intensity: f32,
+    pub rotation_degrees: f32,
+}
+
+impl EnvironmentSettings {
+    pub fn disabled() -> Self {
+        Self {
+            map_file: None,
+            intensity: 0.0,
+            rotation_degrees: 0.0,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.map_file.is_some() && self.intensity > 0.0
+    }
+}
 
 /// GPU-resident path cache and relighting pipelines.
 pub struct RelightPipeline {
@@ -130,6 +153,9 @@ pub struct RelightPipeline {
     material_view: wgpu::TextureView,
     _specular_texture: wgpu::Texture,
     specular_view: wgpu::TextureView,
+    _environment_texture: wgpu::Texture,
+    environment_view: wgpu::TextureView,
+    environment_settings: EnvironmentSettings,
     ldr_texture: wgpu::Texture,
     ldr_view: wgpu::TextureView,
     gather_pipeline: wgpu::ComputePipeline,
@@ -152,6 +178,7 @@ impl RelightPipeline {
         camera: &Camera,
         objects: &[Arc<Object>],
         directional_lights: &[DirectionalLight],
+        environment: &EnvironmentSettings,
         export_jsonl: Option<&Path>,
         weights_path: &Path,
         output_path: &Path,
@@ -165,6 +192,7 @@ impl RelightPipeline {
             camera,
             objects,
             directional_lights,
+            environment,
             export_jsonl,
         )?;
         pipeline.load_nrp_weights(weights_path)?;
@@ -184,6 +212,7 @@ impl RelightPipeline {
         camera: &Camera,
         objects: &[Arc<Object>],
         directional_lights: &[DirectionalLight],
+        environment: &EnvironmentSettings,
         export_jsonl: Option<&Path>,
     ) -> Result<Self, Box<dyn Error>> {
         let path_cache = gpu::record_scene_paths_gpu_resident(
@@ -218,6 +247,7 @@ impl RelightPipeline {
             samples_per_pixel,
             max_depth,
             camera.origin,
+            environment.clone(),
             &aux_buffers,
         ))
     }
@@ -229,6 +259,7 @@ impl RelightPipeline {
         samples_per_pixel: u32,
         max_depth: u32,
         camera_origin: Vec3,
+        environment_settings: EnvironmentSettings,
         aux_buffers: &FrameBuffers,
     ) -> Result<Self, Box<dyn Error>> {
         let GpuPathCache {
@@ -254,6 +285,8 @@ impl RelightPipeline {
             specular_texture,
             specular_view,
         ) = upload_aux_textures(&device, &queue, width, height, aux_buffers)?;
+        let (environment_texture, environment_view) =
+            upload_environment_texture(&device, &queue, &environment_settings)?;
         let ldr_texture = create_rgba8_texture(&device, width, height, "krust ldr");
         let ldr_view = ldr_texture.create_view(&Default::default());
 
@@ -338,6 +371,9 @@ impl RelightPipeline {
             material_view,
             _specular_texture: specular_texture,
             specular_view,
+            _environment_texture: environment_texture,
+            environment_view,
+            environment_settings,
             ldr_texture,
             ldr_view,
             gather_pipeline,
@@ -373,7 +409,8 @@ impl RelightPipeline {
                         texture_entry_non_filterable(5),
                         texture_entry_non_filterable(6),
                         texture_entry_non_filterable(7),
-                        storage_texture_rgba8_entry(8),
+                        texture_entry_non_filterable(8),
+                        storage_texture_rgba8_entry(9),
                     ],
                 });
         let nrp_pipeline = self
@@ -434,6 +471,16 @@ impl RelightPipeline {
                 self.camera_origin.x as f32,
                 self.camera_origin.y as f32,
                 self.camera_origin.z as f32,
+                0.0,
+            ],
+            environment: [
+                self.environment_settings.intensity,
+                self.environment_settings.rotation_degrees.to_radians(),
+                if self.environment_settings.enabled() {
+                    1.0
+                } else {
+                    0.0
+                },
                 0.0,
             ],
         };
@@ -540,6 +587,10 @@ impl RelightPipeline {
                         },
                         wgpu::BindGroupEntry {
                             binding: 8,
+                            resource: wgpu::BindingResource::TextureView(&self.environment_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 9,
                             resource: wgpu::BindingResource::TextureView(&self.ldr_view),
                         },
                     ],
@@ -988,6 +1039,66 @@ fn upload_aux_textures(
     ))
 }
 
+fn upload_environment_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    settings: &EnvironmentSettings,
+) -> Result<(wgpu::Texture, wgpu::TextureView), Box<dyn Error>> {
+    let (width, height, data) = if let Some(path) = &settings.map_file {
+        if !Path::new(path).exists() {
+            return Err(format!("environment map does not exist: {path}").into());
+        }
+        let map = TextureMap::try_new(path, false)
+            .map_err(|err| format!("failed to load environment map {path}: {err}"))?;
+        let (width, height) = map.image.dimensions();
+        let mut data = Vec::with_capacity((width * height * 4) as usize);
+        for pixel in map.image.pixels() {
+            data.push(pixel[0]);
+            data.push(pixel[1]);
+            data.push(pixel[2]);
+            data.push(1.0);
+        }
+        (width, height, data)
+    } else {
+        (1, 1, vec![0.0, 0.0, 0.0, 1.0])
+    };
+
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("krust environment"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+    });
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &texture,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        bytemuck::cast_slice(&data),
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: Some(std::num::NonZeroU32::new(width * 16).unwrap()),
+            rows_per_image: Some(std::num::NonZeroU32::new(height).unwrap()),
+        },
+        wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    let view = texture.create_view(&Default::default());
+    Ok((texture, view))
+}
+
 fn create_rgba8_texture(
     device: &wgpu::Device,
     width: u32,
@@ -1342,6 +1453,7 @@ struct GatherParams {
     _pad0: u32,
     _pad1: u32,
     camera_origin: vec4<f32>,
+    environment: vec4<f32>,
 };
 
 struct EditorLight {
@@ -1371,7 +1483,8 @@ struct NrpHeader {
 @group(0) @binding(5) var position_features: texture_2d<f32>;
 @group(0) @binding(6) var material_features: texture_2d<f32>;
 @group(0) @binding(7) var specular_features: texture_2d<f32>;
-@group(0) @binding(8) var output: texture_storage_2d<rgba8unorm, write>;
+@group(0) @binding(8) var environment_map: texture_2d<f32>;
+@group(0) @binding(9) var output: texture_storage_2d<rgba8unorm, write>;
 
 fn reinhard(c: vec3<f32>) -> vec3<f32> {
     let l = dot(c, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -1493,10 +1606,105 @@ fn direct_light_estimate(
     let view_dir = view_vec / view_len;
     let half_dir = normalize(light_dir + view_dir);
     let spec_power = pow(1.0 - roughness, 4.0) * 1000.0 + 3.5;
-    let spec_color = mix(specular_value.rgb, albedo_depth.rgb, metallic);
-    let specular = spec_color * specular_weight * pow(max(dot(n, half_dir), 0.0), spec_power);
+    let f0 = mix(clamp(specular_value.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * (0.04 * specular_weight), albedo_depth.rgb, metallic);
+    let fresnel = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - clamp(dot(half_dir, view_dir), 0.0, 1.0), 5.0);
+    let specular = fresnel * pow(max(dot(n, half_dir), 0.0), spec_power) * ndotl;
 
     return (diffuse + specular) * light.color.rgb * light.color.w * (radius * radius / dist_sq);
+}
+
+fn env_uv(direction: vec3<f32>) -> vec2<f32> {
+    let dir = normalize(direction);
+    let phi = atan2(dir.z, dir.x) + params.environment.y;
+    let theta = asin(clamp(-dir.y, -1.0, 1.0));
+    return vec2<f32>(
+        fract(1.0 - (phi + 3.14159265359) / 6.28318530718),
+        clamp(1.0 - (theta + 1.57079632679) / 3.14159265359, 0.0, 1.0)
+    );
+}
+
+fn env_texel(x: i32, y: i32, dims: vec2<i32>) -> vec3<f32> {
+    let wrapped_x = ((x % dims.x) + dims.x) % dims.x;
+    let clamped_y = clamp(y, 0, dims.y - 1);
+    return textureLoad(environment_map, vec2<i32>(wrapped_x, clamped_y), 0).rgb;
+}
+
+fn env_sample(direction: vec3<f32>) -> vec3<f32> {
+    if (params.environment.z <= 0.0 || params.environment.x <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let dims_raw = textureDimensions(environment_map);
+    let dims = vec2<i32>(i32(dims_raw.x), i32(dims_raw.y));
+    let uv = env_uv(direction);
+    let coord = vec2<f32>(uv.x * f32(dims.x) - 0.5, uv.y * f32(dims.y) - 0.5);
+    let base = vec2<i32>(i32(floor(coord.x)), i32(floor(coord.y)));
+    let frac = coord - vec2<f32>(base);
+    let c00 = env_texel(base.x, base.y, dims);
+    let c10 = env_texel(base.x + 1, base.y, dims);
+    let c01 = env_texel(base.x, base.y + 1, dims);
+    let c11 = env_texel(base.x + 1, base.y + 1, dims);
+    return mix(mix(c00, c10, frac.x), mix(c01, c11, frac.x), frac.y) * params.environment.x;
+}
+
+fn env_specular(direction: vec3<f32>, normal: vec3<f32>, roughness: f32) -> vec3<f32> {
+    let r = clamp(roughness, 0.0, 1.0);
+    let spread = r * r * 1.35;
+    let d0 = normalize(direction);
+    let basis_normal = select(normal, d0, length(cross(d0, normal)) > 0.01);
+    let tangent = normalize(cross(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(basis_normal.y) > 0.95), basis_normal));
+    let bitangent = cross(basis_normal, tangent);
+    let c0 = env_sample(d0) * 0.36;
+    let c1 = env_sample(normalize(d0 + tangent * spread)) * 0.12;
+    let c2 = env_sample(normalize(d0 - tangent * spread)) * 0.12;
+    let c3 = env_sample(normalize(d0 + bitangent * spread)) * 0.12;
+    let c4 = env_sample(normalize(d0 - bitangent * spread)) * 0.12;
+    let c5 = env_sample(normalize(d0 + (tangent + bitangent) * spread * 0.7)) * 0.08;
+    let c6 = env_sample(normalize(d0 - (tangent + bitangent) * spread * 0.7)) * 0.08;
+    return c0 + c1 + c2 + c3 + c4 + c5 + c6;
+}
+
+fn env_diffuse(normal: vec3<f32>) -> vec3<f32> {
+    let tangent = normalize(cross(select(vec3<f32>(0.0, 1.0, 0.0), vec3<f32>(1.0, 0.0, 0.0), abs(normal.y) > 0.95), normal));
+    let bitangent = cross(normal, tangent);
+    return (
+        env_sample(normal) * 0.40
+        + env_sample(normalize(normal + tangent * 0.85)) * 0.15
+        + env_sample(normalize(normal - tangent * 0.85)) * 0.15
+        + env_sample(normalize(normal + bitangent * 0.85)) * 0.15
+        + env_sample(normalize(normal - bitangent * 0.85)) * 0.15
+    );
+}
+
+fn environment_estimate(
+    albedo_depth: vec4<f32>,
+    normal_value: vec4<f32>,
+    position_value: vec4<f32>,
+    material_value: vec4<f32>,
+    specular_value: vec4<f32>,
+) -> vec3<f32> {
+    if (albedo_depth.a <= 0.0) {
+        return vec3<f32>(0.0);
+    }
+    let normal_len = length(normal_value.xyz);
+    if (normal_len <= 0.000001) {
+        return vec3<f32>(0.0);
+    }
+    let n = normal_value.xyz / normal_len;
+    let roughness = clamp(material_value.r, 0.02, 1.0);
+    let metallic = clamp(material_value.g, 0.0, 1.0);
+    let specular_weight = clamp(material_value.b, 0.0, 1.0);
+    let diffuse_weight = clamp(material_value.a - metallic, 0.0, 1.0);
+    let view_vec = params.camera_origin.xyz - position_value.xyz;
+    let view_len = max(length(view_vec), 0.0001);
+    let view_dir = view_vec / view_len;
+    let incident = -view_dir;
+    let reflection = normalize(incident - 2.0 * dot(incident, n) * n);
+    let spec_env = env_specular(reflection, n, roughness);
+    let diffuse_env = env_diffuse(n) * albedo_depth.rgb * diffuse_weight * (1.0 - metallic);
+    let f0 = mix(clamp(specular_value.rgb, vec3<f32>(0.0), vec3<f32>(1.0)) * (0.04 * specular_weight), albedo_depth.rgb, metallic);
+    let fresnel = f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - clamp(dot(n, view_dir), 0.0, 1.0), 5.0);
+    let spec_strength = mix(1.0, 0.35, roughness);
+    return diffuse_env * 0.55 + spec_env * fresnel * spec_strength;
 }
 
 @compute @workgroup_size(8, 8, 1)
@@ -1506,6 +1714,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     }
     let pixel = id.xy;
     var accum = vec3<f32>(0.0);
+    let aux = textureLoad(aux_features, vec2<i32>(pixel), 0);
+    let normal = textureLoad(normal_features, vec2<i32>(pixel), 0);
+    let position = textureLoad(position_features, vec2<i32>(pixel), 0);
+    let material = textureLoad(material_features, vec2<i32>(pixel), 0);
+    let specular = textureLoad(specular_features, vec2<i32>(pixel), 0);
+    accum = accum + environment_estimate(aux, normal, position, material, specular);
 
     for (var l = 0u; l < params.light_count; l = l + 1u) {
         let light = lights[l];
@@ -1534,11 +1748,6 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         features[feature_index + 7u] = light.color.g;
         features[feature_index + 8u] = light.color.b;
         features[feature_index + 9u] = log(max(light.color.w, 0.0001));
-        let aux = textureLoad(aux_features, vec2<i32>(pixel), 0);
-        let normal = textureLoad(normal_features, vec2<i32>(pixel), 0);
-        let position = textureLoad(position_features, vec2<i32>(pixel), 0);
-        let material = textureLoad(material_features, vec2<i32>(pixel), 0);
-        let specular = textureLoad(specular_features, vec2<i32>(pixel), 0);
         features[feature_index + 10u] = aux.r;
         features[feature_index + 11u] = aux.g;
         features[feature_index + 12u] = aux.b;
